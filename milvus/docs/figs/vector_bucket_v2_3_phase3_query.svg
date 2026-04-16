@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1450 700" width="1450" height="700" role="img" aria-label="V2.3 Phase 2 Query Flow">
+  <title>V2.3 Phase 2 Query 流程图</title>
+  <desc>Phase 2 查询流程：Router 按 tier 路由到标准档（按需 load）或性能档（常驻 load）。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f7f4; }
+      .laneA { fill: #eef5f0; }
+      .laneB { fill: #e8eef8; }
+      .title { font: 700 28px 'Segoe UI', 'PingFang SC', sans-serif; fill: #1f2d24; }
+      .sub { font: 400 15px 'Segoe UI', 'PingFang SC', sans-serif; fill: #59675e; }
+      .head { font: 700 18px 'Segoe UI', 'PingFang SC', sans-serif; fill: #223229; }
+      .step { font: 700 15px 'Segoe UI', 'PingFang SC', sans-serif; fill: #223229; }
+      .text { font: 400 14px 'Segoe UI', 'PingFang SC', sans-serif; fill: #32433a; }
+      .small { font: 400 13px 'Segoe UI', 'PingFang SC', sans-serif; fill: #5a685f; }
+      .box { fill: #fff; stroke: #41584d; stroke-width: 2; rx: 16; ry: 16; }
+      .boxb { fill: #fff; stroke: #5b6f9a; stroke-width: 2; rx: 16; ry: 16; }
+      .boxp { fill: #f3f6ff; stroke: #4d668b; stroke-width: 2; rx: 16; ry: 16; }
+      .arrow { stroke: #42594d; stroke-width: 3; fill: none; marker-end: url(#a); }
+      .arrow-perf { stroke: #4d668b; stroke-width: 3; fill: none; marker-end: url(#ap); }
+      .pill { fill: #f9eecf; stroke: #9d7e2e; stroke-width: 1.5; rx: 12; ry: 12; }
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#42594d"/>
+    </marker>
+    <marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4d668b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1450" height="700"/>
+  <text class="title" x="48" y="56">V2.3 Phase 2 Query 流程图</text>
+  <text class="sub" x="48" y="84">标准档走按需 load（可能冷启动），性能档 collection 始终常驻内存、无 load 延迟。</text>
+
+  <!-- 泳道 -->
+  <rect class="laneA" x="40" y="120" width="1370" height="230"/>
+  <text class="head" x="60" y="152">路径 A：标准档查询（tier = standard）</text>
+
+  <rect class="laneB" x="40" y="370" width="1370" height="230"/>
+  <text class="head" x="60" y="402">路径 B：性能档查询（tier = performance）</text>
+
+  <!-- 路径 A: 标准档 -->
+  <rect class="box" x="70" y="180" width="180" height="80"/>
+  <text class="step" x="98" y="218">1. Client</text>
+  <text class="text" x="98" y="242">QueryVectors</text>
+
+  <rect class="box" x="290" y="180" width="210" height="80"/>
+  <text class="step" x="318" y="218">2. Router</text>
+  <text class="text" x="318" y="242">tier=standard → vb_*</text>
+
+  <rect class="box" x="540" y="180" width="220" height="80"/>
+  <text class="step" x="568" y="218">3. Load Controller</text>
+  <text class="text" x="568" y="242">按需 load（LRU 管理）</text>
+
+  <rect class="boxb" x="800" y="180" width="240" height="80"/>
+  <text class="step" x="828" y="218">4. Milvus Search</text>
+  <text class="text" x="828" y="242">IVF_SQ8 + mmap</text>
+
+  <rect class="box" x="1080" y="180" width="280" height="80"/>
+  <text class="step" x="1108" y="218">5. 返回 topK</text>
+  <text class="text" x="1108" y="242">sub-second（冷启动含 load）</text>
+
+  <path class="arrow" d="M 250 220 L 290 220"/>
+  <path class="arrow" d="M 500 220 L 540 220"/>
+  <path class="arrow" d="M 760 220 L 800 220"/>
+  <path class="arrow" d="M 1040 220 L 1080 220"/>
+
+  <!-- 路径 B: 性能档 -->
+  <rect class="boxp" x="70" y="430" width="180" height="80"/>
+  <text class="step" x="98" y="468">1. Client</text>
+  <text class="text" x="98" y="492">QueryVectors</text>
+
+  <rect class="boxp" x="290" y="430" width="210" height="80"/>
+  <text class="step" x="318" y="468">2. Router</text>
+  <text class="text" x="318" y="492">tier=performance → vbh_*</text>
+
+  <rect class="boxp" x="540" y="430" width="220" height="80"/>
+  <text class="step" x="568" y="468">3. 无需 load</text>
+  <text class="text" x="568" y="492">collection 已 Pin 常驻</text>
+
+  <rect class="boxp" x="800" y="430" width="240" height="80"/>
+  <text class="step" x="828" y="468">4. Milvus Search</text>
+  <text class="text" x="828" y="492">HNSW（RAM 常驻）</text>
+
+  <rect class="boxp" x="1080" y="430" width="280" height="80"/>
+  <text class="step" x="1108" y="468">5. 返回 topK</text>
+  <text class="text" x="1108" y="492">ms 级，无冷启动</text>
+
+  <path class="arrow-perf" d="M 250 470 L 290 470"/>
+  <path class="arrow-perf" d="M 500 470 L 540 470"/>
+  <path class="arrow-perf" d="M 760 470 L 800 470"/>
+  <path class="arrow-perf" d="M 1040 470 L 1080 470"/>
+
+  <!-- 底部说明 -->
+  <rect class="pill" x="40" y="630" width="1370" height="38"/>
+  <text class="small" x="64" y="654">一句话：两条路径的关键差别在 Load Controller。标准档按需 load + LRU，有冷启动延迟；性能档始终 Pin 常驻，无 load 成本。Router 按 Metadata 中的 tier 字段分流。</text>
+</svg>
