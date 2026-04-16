@@ -2,50 +2,87 @@
 
 > **给 Agent 执行者:** 必须使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务执行本计划。步骤使用 `- [ ]` 语法追踪进度。
 
-**目标:** 构建 Vector Bucket Gateway 服务，提供 REST API 实现 bucket/collection/vector 的 CRUD 和查询操作，底层对接 Milvus Standalone（IVF_SQ8+mmap），包含 LRU/TTL Load/Release 控制器、配额管控和监控指标。
+> **实现位置修正:** Phase 1 应落在 **JuiceFS** 的 S3 Gateway 上实现，而不是在 Milvus 仓库里新增一个独立的 Gin/HTTP 服务。本文档保留在 `milvus/docs/`，仅作为 JuiceFS + Milvus 联动设计与任务拆解。
 
-**架构:** 一个独立的 Go HTTP 服务（`internal/vectorbucket/`），使用 Gin 框架（go.mod 中已有），分层设计：Gateway（HTTP handler + 鉴权 + 限流）-> Metadata Service（SQLite 持久化 bucket/collection 状态）-> Namespace Router（逻辑名 -> 物理名映射）-> Load/Release Controller（LRU+TTL 内存预算管理）-> Milvus Adapter（封装 `client/milvusclient`）。服务与 Milvus Standalone 同 VM 部署，通过 gRPC localhost 连接。
+**目标:** 在 JuiceFS 的 S3 Gateway 上提供 Vector Bucket 能力，对外兼容 AWS S3 Vector Bucket API；JuiceFS 负责协议入口、bucket 生命周期、鉴权与请求编排，Milvus Standalone（IVF_SQ8+mmap）负责底层向量写入、索引和检索，同时补齐 LRU/TTL Load/Release 控制器、配额管控和监控指标。
 
-**技术栈:** Go、Gin HTTP 框架、Milvus Go Client（`client/milvusclient`）、SQLite（`modernc.org/sqlite`，纯 Go 无 CGo）、Prometheus client_golang 指标。
+**实现边界:** 不在 Milvus 仓库新增 `internal/vectorbucket` 独立服务。真正的实现方式是在 JuiceFS 现有 `cmd/gateway.go` / `pkg/gateway/gateway.go` 基础上扩展 Vector Bucket 语义，并把核心业务逻辑沉淀到 `pkg/gateway/vectorbucket/` 子模块。JuiceFS 当前 gateway 是通过 `jfsObjects` 实现 `minio.ObjectLayer` 并交给 `minio.ServerMainForJFS` 托管，不存在一个现成、独立维护的 Gin 路由层可直接挂载。
+
+**架构:** `cmd/gateway.go` 负责启动参数和依赖装配，`pkg/gateway/gateway.go` 中的 `NewJFSGateway` / `jfsObjects` 是 JuiceFS 侧真正的扩展点。Phase 1 应把 Vector Bucket 运行时挂到 `jfsObjects` 上，由 bucket/object 生命周期方法做后端编排；如果当前 `github.com/juicedata/minio` fork 还不能识别 S3 Vector Bucket 请求，则再补一个最小协议 shim，把请求分发给 JuiceFS 定义的扩展接口。子模块内部继续分层：Runtime（依赖装配） -> Metadata Service（SQLite 持久化 bucket/collection 状态） -> Namespace Router（逻辑名 -> 物理名映射） -> Load/Release Controller（LRU+TTL 内存预算管理） -> Milvus Adapter（封装 `client/milvusclient`）。Gateway 与 Milvus Standalone 同 VM 部署，通过 gRPC localhost 连接。
+
+**技术栈:** Go、JuiceFS 现有 S3 Gateway（基于 MinIO Gateway 集成）、`github.com/juicedata/minio` fork（开发期通过 JuiceFS `go.mod` 的 `replace` 指向本地 `JUICEDATA_MINIO_ROOT` 目录，而不是把 minio 代码放进当前仓库）、Milvus Go Client（`client/milvusclient`）、SQLite（`modernc.org/sqlite`，纯 Go 无 CGo）、Prometheus client_golang 指标。
+
+**AWS API 对齐说明:** AWS S3 Vectors 当前使用的是一组独立 API 操作，而不是标准 S3 bucket/object API 变体。最关键的 Phase 1 操作包括 `CreateVectorBucket`、`GetVectorBucket`、`DeleteVectorBucket`、`CreateIndex`、`DeleteIndex`、`PutVectors`、`DeleteVectors`、`QueryVectors`。这意味着仅靠 `MakeBucketWithLocation`、`PutObject`、`DeleteObject` 等标准 `minio.ObjectLayer` 方法不足以实现“对外兼容 AWS S3 Vector Bucket API”；协议层 shim 需要优先验证，且大概率是必需的。
 
 ---
 
-## 文件结构
+## 实现落点与文件结构
+
+### 执行映射约定
+
+- 下文所有代码路径均相对 **JuiceFS 仓库根目录**，除非特别说明。
+- 本计划默认本地还存在一个与 `juicefs-1.3.0-rc1/` 平级的 `JUICEDATA_MINIO_ROOT` 目录，例如 `../juicedata-minio/`；它是**单独的本地仓库目录**，不是当前 `juicefs-milvus` 仓库的子目录、子模块或受管文件。
+- 下文旧写法 `internal/vectorbucket/*` 在执行时统一映射为 `pkg/gateway/vectorbucket/*`。
+- 下文旧写法 `github.com/juicedata/juicefs/pkg/gateway/vectorbucket/...` 在执行时统一映射为 `github.com/juicedata/juicefs/pkg/gateway/vectorbucket/...`。
+- 下文旧写法 `internal/vectorbucket/cmd/main.go` 在执行时统一落实为 `cmd/gateway.go` 的接线改动，以及 `pkg/gateway/vectorbucket/bootstrap.go` 的初始化逻辑。
+- 下文 `Gin`、`/v1/...`、`HTTP Handler` 相关描述只表示职责拆分；真正对外协议必须挂到 JuiceFS S3 Gateway 上，并遵循 AWS S3 Vector Bucket API 语义，而不是新开一套独立 REST 服务。
+- 下文若代码块仍出现 `package gateway`、`NewServer()`、`ServeHTTP()` 或 `/v1/...`，都以 “挂接到 JuiceFS S3 gateway 请求路径 / object layer 扩展点” 为准，示例代码仅表达组件边界，不代表最终入口形式。
+- JuiceFS 当前是通过 `jfsObjects` 实现 `minio.ObjectLayer`；因此任务 9-16 的**真实主落点**优先级是：`cmd/gateway.go` -> `pkg/gateway/gateway.go` -> `pkg/gateway/vectorbucket/*`。只有当 `github.com/juicedata/minio` fork 缺少 Vector Bucket 协议解析能力时，才额外引入 fork 侧的协议 shim 任务。
+- 本计划中所有 minio 侧改动都指向 `$JUICEDATA_MINIO_ROOT`，并通过 JuiceFS `go.mod` 的本地 `replace github.com/minio/minio => <local-path>` 联调；不要把 minio 文件直接放进当前仓库，也不要把它作为本仓变更的一部分提交。
+- 下文所有 `cd /root/xty/milvus` 的命令，在执行时统一替换为进入 JuiceFS 仓库根目录。
+
+### 真实接入链
+
+1. S3 请求由 `cmd/gateway.go` 启动的 `minio.ServerMainForJFS` 接收。
+2. `github.com/juicedata/minio` fork 完成协议解析，并把标准 bucket/object 请求下沉到 `minio.ObjectLayer`。
+3. `github.com/juicedata/minio` fork 需要识别独立的 Vector API，例如 `POST /CreateVectorBucket`、`POST /CreateIndex`、`POST /PutVectors`、`POST /QueryVectors`，并把这些请求转发到 JuiceFS 定义的扩展接口。
+4. JuiceFS 侧由 `pkg/gateway/gateway.go` 中的 `jfsObjects` 或与其关联的 runtime 承接这些扩展调用，再委托给 `pkg/gateway/vectorbucket.Runtime`。
+5. `Runtime` 调用 `metadata`、`router`、`controller`、`adapter` 完成状态持久化、Milvus 操作和负载控制。
+6. 标准 `ObjectLayer` 方法继续服务普通 S3 请求；不要把 Vector API 错误地硬塞进普通 `CreateBucket` / `PutObject` 语义里。
 
 ```
-internal/vectorbucket/
-  cmd/                          # 入口
-    main.go                     # 服务启动引导
+cmd/
+  gateway.go                            # JuiceFS S3 Gateway 入口，挂接 Vector Bucket 启动参数与初始化
+
+pkg/gateway/
+  gateway.go                            # 现有 S3 Gateway 实现；NewJFSGateway/jfsObjects 的真实接入点
+  gateway_test.go                       # Gateway 级回归测试；验证 jfsObjects hook
+  vectorbucket/
+    bootstrap.go                        # 组件装配与生命周期管理
+    runtime.go                          # Runtime 聚合：store/router/controller/adapter/quota/metrics
+    protocol.go                         # JuiceFS 与 juicedata/minio 之间的协议桥接约定
+    errors.go                           # MinIO / S3 / Vector Bucket 错误映射
+    config/
+      config.go                         # 配置结构体 + 环境变量加载
+    metadata/
+      store.go                          # MetadataStore 接口定义
+      sqlite_store.go                   # SQLite 实现
+      models.go                         # Bucket、LogicalCollection 结构体
+    router/
+      namespace_router.go               # 逻辑名 -> 物理 Milvus collection 名解析
+    adapter/
+      milvus_adapter.go                 # 封装 milvusclient，提供 collection/vector 操作
+    controller/
+      load_controller.go                # LRU + TTL load/release 逻辑
+    bucket_service.go                   # Bucket 生命周期与 metadata/Milvus 编排
+    object_service.go                   # Put/Delete/Tagging 等对象级写路径编排
+    query_service.go                    # Query / Load / Release 编排
+    quota/
+      quota.go                          # 配额检查逻辑
+    metrics/
+      metrics.go                        # Prometheus 指标定义
+
+$JUICEDATA_MINIO_ROOT/
+  cmd/                                  # 本地独立 minio 仓库目录；仅在缺少 Vector Bucket 协议解析时修改
+    <protocol shim>                     # 识别 CreateVectorBucket/CreateIndex/PutVectors/QueryVectors 等请求并调用 JuiceFS 扩展接口
+```
+
+```
+pkg/gateway/vectorbucket/
   config/
-    config.go                   # 配置结构体 + 环境变量加载
-  metadata/
-    store.go                    # MetadataStore 接口定义
-    sqlite_store.go             # SQLite 实现
-    models.go                   # Bucket、LogicalCollection 结构体
-  router/
-    namespace_router.go         # 逻辑名 -> 物理 Milvus collection 名解析
-  adapter/
-    milvus_adapter.go           # 封装 milvusclient，提供 collection/vector 操作
-  controller/
-    load_controller.go          # LRU + TTL load/release 逻辑
-  gateway/
-    server.go                   # Gin 引擎配置、路由注册
-    handlers_bucket.go          # Bucket CRUD handler
-    handlers_collection.go      # Collection CRUD handler
-    handlers_vector.go          # Vector put/upsert/delete handler
-    handlers_query.go           # 查询 handler
-    middleware.go               # 鉴权、限流、配额中间件
-    errors.go                   # 统一错误响应
-  quota/
-    quota.go                    # 配额检查逻辑
-  metrics/
-    metrics.go                  # Prometheus 指标定义
-```
-
-```
-internal/vectorbucket/
-  cmd/
-    main_test.go
+    config_test.go
+  runtime_test.go
+  protocol_test.go
   metadata/
     sqlite_store_test.go
   router/
@@ -54,29 +91,33 @@ internal/vectorbucket/
     milvus_adapter_test.go
   controller/
     load_controller_test.go
-  gateway/
-    handlers_bucket_test.go
-    handlers_collection_test.go
-    handlers_vector_test.go
-    handlers_query_test.go
+  bucket_service_test.go
+  object_service_test.go
+  query_service_test.go
   quota/
     quota_test.go
   integration/
-    api_test.go                 # 端到端集成测试
+    gateway_contract_test.go            # 端到端集成测试
+
+pkg/gateway/
+  gateway_test.go                       # JuiceFS Gateway 与 Vector Bucket hook 集成验证
 ```
+
+> 下文任务拆分大体保留原计划的组件顺序，但执行时必须以上述 JuiceFS 落点和映射规则为准。
 
 ---
 
 ## 任务 1：项目脚手架 + 配置模块
 
 **文件:**
-- 新建: `internal/vectorbucket/config/config.go`
-- 新建: `internal/vectorbucket/cmd/main.go`
+- 修改: `cmd/gateway.go`
+- 新建: `pkg/gateway/vectorbucket/bootstrap.go`
+- 新建: `pkg/gateway/vectorbucket/config/config.go`
 
 - [ ] **步骤 1: 编写配置测试**
 
 ```go
-// internal/vectorbucket/config/config_test.go
+// pkg/gateway/vectorbucket/config/config_test.go
 package config
 
 import (
@@ -108,13 +149,13 @@ func TestConfigFromEnv(t *testing.T) {
 
 - [ ] **步骤 2: 运行测试确认失败**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/config/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/config/...`
 预期: FAIL — package 不存在
 
 - [ ] **步骤 3: 实现配置模块**
 
 ```go
-// internal/vectorbucket/config/config.go
+// pkg/gateway/vectorbucket/config/config.go
 package config
 
 import (
@@ -185,37 +226,39 @@ func LoadConfig() Config {
 
 - [ ] **步骤 4: 运行测试确认通过**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/config/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/config/...`
 预期: PASS
 
-- [ ] **步骤 5: 编写 main.go 占位文件**
+- [ ] **步骤 5: 编写 bootstrap.go 占位文件**
 
 ```go
-// internal/vectorbucket/cmd/main.go
-package main
+// pkg/gateway/vectorbucket/bootstrap.go
+package vectorbucket
 
 import (
-	"fmt"
-
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
 )
 
-func main() {
+type Bootstrap struct {
+	Config config.Config
+}
+
+func NewBootstrap() *Bootstrap {
 	cfg := config.LoadConfig()
-	fmt.Printf("Vector Bucket Gateway starting on %s, Milvus at %s\n", cfg.ListenAddr, cfg.MilvusAddr)
+	return &Bootstrap{Config: cfg}
 }
 ```
 
 - [ ] **步骤 6: 验证编译通过**
 
-运行: `cd /root/xty/milvus && go build ./internal/vectorbucket/cmd/`
+运行: `cd $JUICEFS_ROOT && go build ./cmd/... ./pkg/gateway/vectorbucket/...`
 预期: 成功，无错误
 
 - [ ] **步骤 7: 提交**
 
 ```bash
-git add internal/vectorbucket/config/ internal/vectorbucket/cmd/
-git commit -s -m "feat(vectorbucket): add project scaffold and configuration
+git add cmd/gateway.go pkg/gateway/vectorbucket/
+git commit -s -m "feat(vectorbucket): add JuiceFS gateway scaffold and configuration
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
@@ -225,13 +268,13 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 2：Metadata 模型 + Store 接口
 
 **文件:**
-- 新建: `internal/vectorbucket/metadata/models.go`
-- 新建: `internal/vectorbucket/metadata/store.go`
+- 新建: `pkg/gateway/vectorbucket/metadata/models.go`
+- 新建: `pkg/gateway/vectorbucket/metadata/store.go`
 
 - [ ] **步骤 1: 编写模型结构体和 Store 接口**
 
 ```go
-// internal/vectorbucket/metadata/models.go
+// pkg/gateway/vectorbucket/metadata/models.go
 package metadata
 
 import "time"
@@ -280,7 +323,7 @@ type LogicalCollection struct {
 ```
 
 ```go
-// internal/vectorbucket/metadata/store.go
+// pkg/gateway/vectorbucket/metadata/store.go
 package metadata
 
 import "context"
@@ -316,13 +359,13 @@ type Store interface {
 
 - [ ] **步骤 2: 验证编译通过**
 
-运行: `cd /root/xty/milvus && go build ./internal/vectorbucket/metadata/`
+运行: `cd $JUICEFS_ROOT && go build ./pkg/gateway/vectorbucket/metadata/`
 预期: 成功
 
 - [ ] **步骤 3: 提交**
 
 ```bash
-git add internal/vectorbucket/metadata/models.go internal/vectorbucket/metadata/store.go
+git add pkg/gateway/vectorbucket/metadata/models.go pkg/gateway/vectorbucket/metadata/store.go
 git commit -s -m "feat(vectorbucket): add metadata models and store interface
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -333,19 +376,19 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 3：SQLite Metadata Store 实现
 
 **文件:**
-- 新建: `internal/vectorbucket/metadata/sqlite_store.go`
-- 新建: `internal/vectorbucket/metadata/sqlite_store_test.go`
+- 新建: `pkg/gateway/vectorbucket/metadata/sqlite_store.go`
+- 新建: `pkg/gateway/vectorbucket/metadata/sqlite_store_test.go`
 
 **说明:** 使用 `modernc.org/sqlite`（纯 Go，无 CGo 依赖）。需先执行 `go get modernc.org/sqlite`。
 
 - [ ] **步骤 1: 添加 SQLite 依赖**
 
-运行: `cd /root/xty/milvus && go get modernc.org/sqlite`
+运行: `cd $JUICEFS_ROOT && go get modernc.org/sqlite`
 
 - [ ] **步骤 2: 编写 Bucket CRUD 失败测试**
 
 ```go
-// internal/vectorbucket/metadata/sqlite_store_test.go
+// pkg/gateway/vectorbucket/metadata/sqlite_store_test.go
 package metadata
 
 import (
@@ -446,13 +489,13 @@ func TestDeleteBucket(t *testing.T) {
 
 - [ ] **步骤 3: 运行测试确认失败**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/metadata/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/metadata/...`
 预期: FAIL — `NewSQLiteStore` 未定义
 
 - [ ] **步骤 4: 实现 SQLiteStore（Bucket + Collection 全部操作）**
 
 ```go
-// internal/vectorbucket/metadata/sqlite_store.go
+// pkg/gateway/vectorbucket/metadata/sqlite_store.go
 package metadata
 
 import (
@@ -711,13 +754,13 @@ func scanCollectionRow(row rowScanner) (*LogicalCollection, error) {
 
 - [ ] **步骤 5: 运行测试确认通过**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/metadata/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/metadata/...`
 预期: PASS
 
 - [ ] **步骤 6: 编写 Collection CRUD 测试**
 
 ```go
-// 追加到 internal/vectorbucket/metadata/sqlite_store_test.go
+// 追加到 pkg/gateway/vectorbucket/metadata/sqlite_store_test.go
 
 func TestCreateAndGetCollection(t *testing.T) {
 	s := newTestStore(t)
@@ -785,13 +828,13 @@ func TestCountCollections(t *testing.T) {
 
 - [ ] **步骤 7: 运行全部 metadata 测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/metadata/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/metadata/...`
 预期: 全部 PASS
 
 - [ ] **步骤 8: 提交**
 
 ```bash
-git add internal/vectorbucket/metadata/
+git add pkg/gateway/vectorbucket/metadata/
 git commit -s -m "feat(vectorbucket): implement SQLite metadata store with bucket and collection CRUD
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -802,13 +845,13 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 4：Namespace Router（命名空间路由）
 
 **文件:**
-- 新建: `internal/vectorbucket/router/namespace_router.go`
-- 新建: `internal/vectorbucket/router/namespace_router_test.go`
+- 新建: `pkg/gateway/vectorbucket/router/namespace_router.go`
+- 新建: `pkg/gateway/vectorbucket/router/namespace_router_test.go`
 
 - [ ] **步骤 1: 编写失败测试**
 
 ```go
-// internal/vectorbucket/router/namespace_router_test.go
+// pkg/gateway/vectorbucket/router/namespace_router_test.go
 package router
 
 import (
@@ -819,7 +862,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
 func newTestRouter(t *testing.T) *NamespaceRouter {
@@ -865,20 +908,20 @@ func TestResolveNotFound(t *testing.T) {
 
 - [ ] **步骤 2: 运行测试确认失败**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/router/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/router/...`
 预期: FAIL
 
 - [ ] **步骤 3: 实现 NamespaceRouter**
 
 ```go
-// internal/vectorbucket/router/namespace_router.go
+// pkg/gateway/vectorbucket/router/namespace_router.go
 package router
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
 // PhysicalCollectionName 生成物理 Milvus collection 名称
@@ -919,13 +962,13 @@ func (r *NamespaceRouter) Resolve(ctx context.Context, bucketName, collectionNam
 
 - [ ] **步骤 4: 运行测试确认通过**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/router/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/router/...`
 预期: PASS
 
 - [ ] **步骤 5: 提交**
 
 ```bash
-git add internal/vectorbucket/router/
+git add pkg/gateway/vectorbucket/router/
 git commit -s -m "feat(vectorbucket): add namespace router for logical-to-physical collection resolution
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -936,13 +979,13 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 5：Milvus Adapter（Milvus 适配层）
 
 **文件:**
-- 新建: `internal/vectorbucket/adapter/milvus_adapter.go`
-- 新建: `internal/vectorbucket/adapter/milvus_adapter_test.go`
+- 新建: `pkg/gateway/vectorbucket/adapter/milvus_adapter.go`
+- 新建: `pkg/gateway/vectorbucket/adapter/milvus_adapter_test.go`
 
 - [ ] **步骤 1: 定义 Adapter 接口和实现**
 
 ```go
-// internal/vectorbucket/adapter/milvus_adapter.go
+// pkg/gateway/vectorbucket/adapter/milvus_adapter.go
 package adapter
 
 import (
@@ -1130,7 +1173,7 @@ func (a *MilvusAdapter) Search(ctx context.Context, name string, vector []float3
 - [ ] **步骤 2: 编写纯函数的单元测试**
 
 ```go
-// internal/vectorbucket/adapter/milvus_adapter_test.go
+// pkg/gateway/vectorbucket/adapter/milvus_adapter_test.go
 package adapter
 
 import (
@@ -1165,13 +1208,13 @@ func TestMetricTypeFromString(t *testing.T) {
 
 - [ ] **步骤 3: 运行测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/adapter/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/adapter/...`
 预期: PASS（仅纯函数测试；Milvus 集成测试在任务 16）
 
 - [ ] **步骤 4: 提交**
 
 ```bash
-git add internal/vectorbucket/adapter/
+git add pkg/gateway/vectorbucket/adapter/
 git commit -s -m "feat(vectorbucket): add Milvus adapter wrapping client for collection and vector operations
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -1182,13 +1225,13 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 6：Load/Release 控制器
 
 **文件:**
-- 新建: `internal/vectorbucket/controller/load_controller.go`
-- 新建: `internal/vectorbucket/controller/load_controller_test.go`
+- 新建: `pkg/gateway/vectorbucket/controller/load_controller.go`
+- 新建: `pkg/gateway/vectorbucket/controller/load_controller_test.go`
 
 - [ ] **步骤 1: 编写失败测试**
 
 ```go
-// internal/vectorbucket/controller/load_controller_test.go
+// pkg/gateway/vectorbucket/controller/load_controller_test.go
 package controller
 
 import (
@@ -1336,13 +1379,13 @@ func TestTouchUpdatesLRU(t *testing.T) {
 
 - [ ] **步骤 2: 运行测试确认失败**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/controller/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/controller/...`
 预期: FAIL
 
 - [ ] **步骤 3: 实现 LoadController**
 
 ```go
-// internal/vectorbucket/controller/load_controller.go
+// pkg/gateway/vectorbucket/controller/load_controller.go
 package controller
 
 import (
@@ -1587,13 +1630,13 @@ func (c *LoadController) removeLRU(name string) {
 
 - [ ] **步骤 4: 运行测试确认通过**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/controller/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/controller/...`
 预期: 全部 PASS
 
 - [ ] **步骤 5: 提交**
 
 ```bash
-git add internal/vectorbucket/controller/
+git add pkg/gateway/vectorbucket/controller/
 git commit -s -m "feat(vectorbucket): implement LRU+TTL Load/Release Controller with budget management
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -1604,13 +1647,13 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 7：配额管控
 
 **文件:**
-- 新建: `internal/vectorbucket/quota/quota.go`
-- 新建: `internal/vectorbucket/quota/quota_test.go`
+- 新建: `pkg/gateway/vectorbucket/quota/quota.go`
+- 新建: `pkg/gateway/vectorbucket/quota/quota_test.go`
 
 - [ ] **步骤 1: 编写失败测试**
 
 ```go
-// internal/vectorbucket/quota/quota_test.go
+// pkg/gateway/vectorbucket/quota/quota_test.go
 package quota
 
 import (
@@ -1622,8 +1665,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
 func newTestChecker(t *testing.T) (*Checker, *metadata.SQLiteStore) {
@@ -1711,21 +1754,21 @@ func TestCheckVectorCount(t *testing.T) {
 
 - [ ] **步骤 2: 运行测试确认失败**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/vectorbucket/quota/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 ./pkg/gateway/vectorbucket/quota/...`
 预期: FAIL
 
 - [ ] **步骤 3: 实现 Checker**
 
 ```go
-// internal/vectorbucket/quota/quota.go
+// pkg/gateway/vectorbucket/quota/quota.go
 package quota
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
 type Checker struct {
@@ -1797,13 +1840,13 @@ func (c *Checker) CheckMetric(metric string) error {
 
 - [ ] **步骤 4: 运行测试确认通过**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/quota/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/quota/...`
 预期: PASS
 
 - [ ] **步骤 5: 提交**
 
 ```bash
-git add internal/vectorbucket/quota/
+git add pkg/gateway/vectorbucket/quota/
 git commit -s -m "feat(vectorbucket): add quota enforcement for buckets, collections, dimensions, and vector counts
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -1814,12 +1857,12 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ## 任务 8：Prometheus 监控指标
 
 **文件:**
-- 新建: `internal/vectorbucket/metrics/metrics.go`
+- 新建: `pkg/gateway/vectorbucket/metrics/metrics.go`
 
 - [ ] **步骤 1: 定义指标**
 
 ```go
-// internal/vectorbucket/metrics/metrics.go
+// pkg/gateway/vectorbucket/metrics/metrics.go
 package metrics
 
 import (
@@ -1884,13 +1927,13 @@ var (
 
 - [ ] **步骤 2: 验证编译通过**
 
-运行: `cd /root/xty/milvus && go build ./internal/vectorbucket/metrics/`
+运行: `cd $JUICEFS_ROOT && go build ./pkg/gateway/vectorbucket/metrics/`
 预期: 成功
 
 - [ ] **步骤 3: 提交**
 
 ```bash
-git add internal/vectorbucket/metrics/
+git add pkg/gateway/vectorbucket/metrics/
 git commit -s -m "feat(vectorbucket): add Prometheus metric definitions
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -1898,1350 +1941,1475 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-## 任务 9：统一错误响应
+## 任务 9：协议契约 + 错误映射
 
 **文件:**
-- 新建: `internal/vectorbucket/gateway/errors.go`
+- 新建: `pkg/gateway/vectorbucket/protocol.go`
+- 新建: `pkg/gateway/vectorbucket/errors.go`
+- 修改: `pkg/gateway/gateway.go`
 
-- [ ] **步骤 1: 编写错误响应辅助函数**
+> **收口目标:** 这里不再出现 `gin.Context` 或独立 handler helper。`protocol.go` 只定义 `juicedata/minio` shim 和 JuiceFS runtime 之间的接口、请求结构、响应结构；`errors.go` 只定义内部错误种类与对外协议错误映射。协议名、字段名和操作名直接对齐 AWS 当前公开 API：`CreateVectorBucket`、`GetVectorBucket`、`DeleteVectorBucket`、`CreateIndex`、`DeleteIndex`、`PutVectors`、`DeleteVectors`、`QueryVectors`。
+
+> **本地联调约束:** 从本任务开始，如果需要改 minio 侧协议层，先在 JuiceFS `go.mod` 暂时把 `github.com/minio/minio` 的 `replace` 改到本地 `$JUICEDATA_MINIO_ROOT`；不要把 minio 代码复制进当前仓库。
+
+- [ ] **步骤 1: 在 `protocol.go` 定义运行时扩展契约**
 
 ```go
-// internal/vectorbucket/gateway/errors.go
-package gateway
+// pkg/gateway/vectorbucket/protocol.go
+package vectorbucket
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
-
-	"github.com/gin-gonic/gin"
+	"strings"
 )
 
-type ErrorResponse struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+type RequestContext struct {
+	AccountID string
+	Region    string
+	RequestID string
+	Headers   http.Header
 }
 
-func respondError(c *gin.Context, code int, msg string) {
-	c.JSON(code, ErrorResponse{Code: code, Message: msg})
+type Target struct {
+	VectorBucketName string `json:"vectorBucketName,omitempty"`
+	VectorBucketARN  string `json:"vectorBucketArn,omitempty"`
+	IndexName        string `json:"indexName,omitempty"`
+	IndexARN         string `json:"indexArn,omitempty"`
 }
 
-func respondNotFound(c *gin.Context, msg string) {
-	respondError(c, http.StatusNotFound, msg)
+func (t Target) ResolveNames() (bucketName string, indexName string, err error) {
+	if t.VectorBucketName != "" {
+		bucketName = t.VectorBucketName
+	}
+	if t.IndexName != "" {
+		indexName = t.IndexName
+	}
+	if bucketName != "" {
+		return bucketName, indexName, nil
+	}
+	if t.IndexARN != "" {
+		parts := strings.Split(strings.TrimPrefix(t.IndexARN, "arn:aws:s3vectors:"), ":")
+		if len(parts) < 3 {
+			return "", "", fmt.Errorf("%w: invalid indexArn", ErrValidation)
+		}
+		resource := parts[2]
+		tokens := strings.Split(resource, "/")
+		if len(tokens) != 4 || tokens[0] != "bucket" || tokens[2] != "index" {
+			return "", "", fmt.Errorf("%w: invalid indexArn resource", ErrValidation)
+		}
+		return tokens[1], tokens[3], nil
+	}
+	if t.VectorBucketARN != "" {
+		parts := strings.Split(strings.TrimPrefix(t.VectorBucketARN, "arn:aws:s3vectors:"), ":")
+		if len(parts) < 3 {
+			return "", "", fmt.Errorf("%w: invalid vectorBucketArn", ErrValidation)
+		}
+		resource := parts[2]
+		tokens := strings.Split(resource, "/")
+		if len(tokens) != 2 || tokens[0] != "bucket" {
+			return "", "", fmt.Errorf("%w: invalid vectorBucketArn resource", ErrValidation)
+		}
+		return tokens[1], "", nil
+	}
+	return "", "", fmt.Errorf("%w: missing vector bucket target", ErrValidation)
 }
 
-func respondBadRequest(c *gin.Context, msg string) {
-	respondError(c, http.StatusBadRequest, msg)
+type EncryptionConfiguration struct {
+	SSEType   string `json:"sseType,omitempty"`
+	KMSKeyARN string `json:"kmsKeyArn,omitempty"`
 }
 
-func respondQuotaExceeded(c *gin.Context, msg string) {
-	respondError(c, http.StatusTooManyRequests, msg)
+type MetadataConfiguration struct {
+	NonFilterableMetadataKeys []string `json:"nonFilterableMetadataKeys,omitempty"`
 }
 
-func respondServiceUnavailable(c *gin.Context, msg string, retryAfterSec int) {
-	c.Header("Retry-After", fmt.Sprintf("%d", retryAfterSec))
-	respondError(c, http.StatusServiceUnavailable, msg)
+type VectorData struct {
+	Float32 []float32 `json:"float32"`
+}
+
+type PutInputVector struct {
+	Key      string          `json:"key"`
+	Data     VectorData      `json:"data"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+}
+
+type QueryResultVector struct {
+	Key      string          `json:"key"`
+	Distance float32         `json:"distance,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+}
+
+type CreateVectorBucketRequest struct {
+	RequestContext
+	VectorBucketName         string                   `json:"vectorBucketName"`
+	EncryptionConfiguration  *EncryptionConfiguration `json:"encryptionConfiguration,omitempty"`
+	Tags                     map[string]string        `json:"tags,omitempty"`
+}
+
+type CreateVectorBucketResponse struct {
+	VectorBucketARN string `json:"vectorBucketArn"`
+}
+
+type GetVectorBucketRequest struct {
+	RequestContext
+	Target
+}
+
+type GetVectorBucketResponse struct {
+	VectorBucketARN        string                   `json:"vectorBucketArn"`
+	VectorBucketName       string                   `json:"vectorBucketName"`
+	CreationTime           string                   `json:"creationTime"`
+	EncryptionConfiguration *EncryptionConfiguration `json:"encryptionConfiguration,omitempty"`
+}
+
+type ListVectorBucketsRequest struct {
+	RequestContext
+	MaxResults int    `json:"maxResults,omitempty"`
+	NextToken  string `json:"nextToken,omitempty"`
+}
+
+type VectorBucketSummary struct {
+	VectorBucketARN  string `json:"vectorBucketArn"`
+	VectorBucketName string `json:"vectorBucketName"`
+	CreationTime     string `json:"creationTime"`
+}
+
+type ListVectorBucketsResponse struct {
+	VectorBuckets []VectorBucketSummary `json:"vectorBuckets"`
+	NextToken     string                `json:"nextToken,omitempty"`
+}
+
+type DeleteVectorBucketRequest struct {
+	RequestContext
+	Target
+}
+
+type CreateIndexRequest struct {
+	RequestContext
+	Target
+	IndexName                string                   `json:"indexName"`
+	DataType                 string                   `json:"dataType"`
+	Dimension                int                      `json:"dimension"`
+	DistanceMetric           string                   `json:"distanceMetric"`
+	EncryptionConfiguration  *EncryptionConfiguration `json:"encryptionConfiguration,omitempty"`
+	MetadataConfiguration    *MetadataConfiguration   `json:"metadataConfiguration,omitempty"`
+	Tags                     map[string]string        `json:"tags,omitempty"`
+}
+
+type CreateIndexResponse struct {
+	IndexARN string `json:"indexArn"`
+}
+
+type DeleteIndexRequest struct {
+	RequestContext
+	Target
+}
+
+type PutVectorsRequest struct {
+	RequestContext
+	Target
+	Vectors []PutInputVector `json:"vectors"`
+}
+
+type DeleteVectorsRequest struct {
+	RequestContext
+	Target
+	Keys []string `json:"keys"`
+}
+
+type QueryVectorsRequest struct {
+	RequestContext
+	Target
+	QueryVector    VectorData       `json:"queryVector"`
+	TopK           int              `json:"topK"`
+	Filter         json.RawMessage  `json:"filter,omitempty"`
+	ReturnDistance bool             `json:"returnDistance,omitempty"`
+	ReturnMetadata bool             `json:"returnMetadata,omitempty"`
+}
+
+type QueryVectorsResponse struct {
+	DistanceMetric string              `json:"distanceMetric"`
+	Vectors        []QueryResultVector `json:"vectors"`
+}
+
+type Extension interface {
+	CreateVectorBucket(context.Context, *CreateVectorBucketRequest) (*CreateVectorBucketResponse, error)
+	GetVectorBucket(context.Context, *GetVectorBucketRequest) (*GetVectorBucketResponse, error)
+	ListVectorBuckets(context.Context, *ListVectorBucketsRequest) (*ListVectorBucketsResponse, error)
+	DeleteVectorBucket(context.Context, *DeleteVectorBucketRequest) error
+	CreateIndex(context.Context, *CreateIndexRequest) (*CreateIndexResponse, error)
+	DeleteIndex(context.Context, *DeleteIndexRequest) error
+	PutVectors(context.Context, *PutVectorsRequest) error
+	DeleteVectors(context.Context, *DeleteVectorsRequest) error
+	QueryVectors(context.Context, *QueryVectorsRequest) (*QueryVectorsResponse, error)
 }
 ```
 
-- [ ] **步骤 2: 验证编译通过**
+- [ ] **步骤 2: 在 `errors.go` 定义内部错误与协议映射**
 
-运行: `cd /root/xty/milvus && go build ./internal/vectorbucket/gateway/`
+```go
+// pkg/gateway/vectorbucket/errors.go
+package vectorbucket
+
+import (
+	"errors"
+	"net/http"
+)
+
+var (
+	ErrValidation         = errors.New("validation failed")
+	ErrConflict           = errors.New("resource already exists")
+	ErrNotFound           = errors.New("resource not found")
+	ErrQuotaExceeded      = errors.New("service quota exceeded")
+	ErrTooManyRequests    = errors.New("request throttled")
+	ErrServiceUnavailable = errors.New("service unavailable")
+	ErrAccessDenied       = errors.New("access denied")
+	ErrRequestTimeout     = errors.New("request timeout")
+	ErrInternal           = errors.New("internal server error")
+)
+
+type APIError struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Status   int    `json:"-"`
+	RetryAfter int  `json:"-"`
+}
+
+func TranslateError(err error) APIError {
+	switch {
+	case err == nil:
+		return APIError{}
+	case errors.Is(err, ErrValidation):
+		return APIError{Code: "ValidationException", Message: err.Error(), Status: http.StatusBadRequest}
+	case errors.Is(err, ErrConflict):
+		return APIError{Code: "ConflictException", Message: err.Error(), Status: http.StatusConflict}
+	case errors.Is(err, ErrNotFound):
+		return APIError{Code: "NotFoundException", Message: err.Error(), Status: http.StatusNotFound}
+	case errors.Is(err, ErrQuotaExceeded):
+		return APIError{Code: "ServiceQuotaExceededException", Message: err.Error(), Status: http.StatusPaymentRequired}
+	case errors.Is(err, ErrTooManyRequests):
+		return APIError{Code: "TooManyRequestsException", Message: err.Error(), Status: http.StatusTooManyRequests}
+	case errors.Is(err, ErrServiceUnavailable):
+		return APIError{Code: "ServiceUnavailableException", Message: err.Error(), Status: http.StatusServiceUnavailable, RetryAfter: 5}
+	case errors.Is(err, ErrAccessDenied):
+		return APIError{Code: "AccessDeniedException", Message: err.Error(), Status: http.StatusForbidden}
+	case errors.Is(err, ErrRequestTimeout):
+		return APIError{Code: "RequestTimeoutException", Message: err.Error(), Status: http.StatusRequestTimeout}
+	default:
+		return APIError{Code: "InternalServerException", Message: err.Error(), Status: http.StatusInternalServerError}
+	}
+}
+```
+
+- [ ] **步骤 3: 在 `pkg/gateway/gateway.go` 增加 shim 可发现接口**
+
+```go
+// pkg/gateway/gateway.go
+package gateway
+
+import "github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
+
+type vectorBucketProvider interface {
+	VectorBucketExtension() vectorbucket.Extension
+}
+```
+
+- [ ] **步骤 4: 验证编译通过**
+
+运行: `cd $JUICEFS_ROOT && go build ./pkg/gateway/vectorbucket/... ./pkg/gateway/...`
 预期: 成功
 
-- [ ] **步骤 3: 提交**
+- [ ] **步骤 5: 提交**
 
 ```bash
-git add internal/vectorbucket/gateway/errors.go
-git commit -s -m "feat(vectorbucket): add HTTP error response helpers
+git add pkg/gateway/vectorbucket/protocol.go pkg/gateway/vectorbucket/errors.go pkg/gateway/gateway.go
+git commit -s -m "feat(vectorbucket): define vector bucket protocol contract and error mapping
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-## 任务 10：Bucket HTTP Handler
+## 任务 10：`jfsObjects` 装配与 Runtime 挂接
+
+> **S3 API 映射约定:** 本任务到任务 16 的目标不是保留 `/v1/...` REST 路径，而是在 JuiceFS S3 gateway 上实现与 AWS S3 Vectors 独立操作对齐的协议路径。Phase 1 的主操作集应至少包含 `CreateVectorBucket`、`GetVectorBucket`、`DeleteVectorBucket`、`CreateIndex`、`DeleteIndex`、`PutVectors`、`DeleteVectors`、`QueryVectors`；若示例测试仍用 `/v1/...`，执行时应改写为 `juicedata/minio` shim 侧协议测试、`jfsObjects` 级测试或 `gateway_test.go` 集成测试。
 
 **文件:**
-- 新建: `internal/vectorbucket/gateway/server.go`
-- 新建: `internal/vectorbucket/gateway/handlers_bucket.go`
-- 新建: `internal/vectorbucket/gateway/handlers_bucket_test.go`
+- 修改: `pkg/gateway/gateway.go`
+- 新建: `pkg/gateway/vectorbucket/runtime.go`
+- 新建: `pkg/gateway/vectorbucket/runtime_test.go`
 
-- [ ] **步骤 1: 编写 Gateway Server 结构体**
+> **实际落点修正:** 这里的目标只有两个：第一，把 `vectorbucket.Extension` 挂到真实的 `jfsObjects` 上；第二，把 metadata/router/controller/adapter/quota 组装成一个可被 shim 调用的 `Runtime`。不要引入任何 `api.NewServer()`、`Engine()` 或独立端口。
+
+- [ ] **步骤 1: 在 `runtime.go` 组装 Runtime 和各 service**
 
 ```go
-// internal/vectorbucket/gateway/server.go
-package gateway
+// pkg/gateway/vectorbucket/runtime.go
+package vectorbucket
 
 import (
 	"context"
-	"net/http"
 
-	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"github.com/milvus-io/milvus/internal/vectorbucket/adapter"
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/controller"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
-	"github.com/milvus-io/milvus/internal/vectorbucket/quota"
-	"github.com/milvus-io/milvus/internal/vectorbucket/router"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/adapter"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
 )
 
-type Server struct {
-	cfg        *config.Config
-	engine     *gin.Engine
-	httpServer *http.Server
+type Runtime struct {
+	cfg        config.Config
 	store      metadata.Store
-	adapter    adapter.Adapter
 	router     *router.NamespaceRouter
+	adapter    adapter.Adapter
 	controller *controller.LoadController
 	quota      *quota.Checker
+	buckets    *BucketService
+	objects    *ObjectService
+	query      *QueryService
 }
 
-func NewServer(cfg *config.Config, store metadata.Store, milvusAdapter adapter.Adapter, ctrl *controller.LoadController) *Server {
-	s := &Server{
+func NewRuntime(cfg config.Config, store metadata.Store, milvus adapter.Adapter, ctrl *controller.LoadController) *Runtime {
+	r := &Runtime{
 		cfg:        cfg,
 		store:      store,
-		adapter:    milvusAdapter,
 		router:     router.NewNamespaceRouter(store),
+		adapter:    milvus,
 		controller: ctrl,
-		quota:      quota.NewChecker(store, cfg),
+		quota:      quota.NewChecker(store, &cfg),
 	}
-
-	gin.SetMode(gin.ReleaseMode)
-	s.engine = gin.New()
-	s.engine.Use(gin.Recovery())
-
-	s.registerRoutes()
-	return s
+	r.buckets = NewBucketService(store, r.quota)
+	r.objects = NewObjectService(store, r.router, milvus, ctrl, r.quota, cfg)
+	r.query = NewQueryService(store, r.router, milvus, ctrl)
+	return r
 }
 
-func (s *Server) registerRoutes() {
-	v1 := s.engine.Group("/v1")
-
-	// Bucket
-	v1.POST("/buckets", s.CreateBucket)
-	v1.GET("/buckets/:bucket", s.GetBucket)
-	v1.DELETE("/buckets/:bucket", s.DeleteBucket)
-
-	// Collection
-	v1.POST("/buckets/:bucket/collections", s.CreateCollection)
-	v1.DELETE("/buckets/:bucket/collections/:collection", s.DeleteCollection)
-
-	// Vector
-	v1.POST("/buckets/:bucket/collections/:collection/vectors", s.PutVectors)
-	v1.POST("/buckets/:bucket/collections/:collection/vectors:upsert", s.UpsertVectors)
-	v1.POST("/buckets/:bucket/collections/:collection/vectors:delete", s.DeleteVectors)
-
-	// 查询
-	v1.POST("/buckets/:bucket/collections/:collection/query", s.QueryVectors)
-
-	// 指标
-	s.engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
-}
-
-func (s *Server) Start() error {
-	s.httpServer = &http.Server{
-		Addr:    s.cfg.ListenAddr,
-		Handler: s.engine,
-	}
-	return s.httpServer.ListenAndServe()
-}
-
-func (s *Server) Stop(ctx context.Context) error {
-	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+func (r *Runtime) Close(context.Context) error {
+	if r.store != nil {
+		return r.store.Close()
 	}
 	return nil
 }
 
-func (s *Server) Engine() *gin.Engine {
-	return s.engine
+func (r *Runtime) CreateVectorBucket(ctx context.Context, req *CreateVectorBucketRequest) (*CreateVectorBucketResponse, error) {
+	return r.buckets.CreateVectorBucket(ctx, req)
+}
+
+func (r *Runtime) GetVectorBucket(ctx context.Context, req *GetVectorBucketRequest) (*GetVectorBucketResponse, error) {
+	return r.buckets.GetVectorBucket(ctx, req)
+}
+
+func (r *Runtime) ListVectorBuckets(ctx context.Context, req *ListVectorBucketsRequest) (*ListVectorBucketsResponse, error) {
+	return r.buckets.ListVectorBuckets(ctx, req)
+}
+
+func (r *Runtime) DeleteVectorBucket(ctx context.Context, req *DeleteVectorBucketRequest) error {
+	return r.buckets.DeleteVectorBucket(ctx, req)
+}
+
+func (r *Runtime) CreateIndex(ctx context.Context, req *CreateIndexRequest) (*CreateIndexResponse, error) {
+	return r.objects.CreateIndex(ctx, req)
+}
+
+func (r *Runtime) DeleteIndex(ctx context.Context, req *DeleteIndexRequest) error {
+	return r.objects.DeleteIndex(ctx, req)
+}
+
+func (r *Runtime) PutVectors(ctx context.Context, req *PutVectorsRequest) error {
+	return r.objects.PutVectors(ctx, req)
+}
+
+func (r *Runtime) DeleteVectors(ctx context.Context, req *DeleteVectorsRequest) error {
+	return r.objects.DeleteVectors(ctx, req)
+}
+
+func (r *Runtime) QueryVectors(ctx context.Context, req *QueryVectorsRequest) (*QueryVectorsResponse, error) {
+	return r.query.QueryVectors(ctx, req)
 }
 ```
 
-- [ ] **步骤 2: 编写 Bucket Handler**
+- [ ] **步骤 2: 在 `pkg/gateway/gateway.go` 挂上 runtime 引用**
 
 ```go
-// internal/vectorbucket/gateway/handlers_bucket.go
+// pkg/gateway/gateway.go
 package gateway
 
-import (
-	"net/http"
+import "github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
-)
-
-type CreateBucketRequest struct {
-	Name string `json:"name" binding:"required"`
+type Config struct {
+	MultiBucket  bool
+	KeepEtag     bool
+	Umask        uint16
+	ObjTag       bool
+	ObjMeta      bool
+	HeadDir      bool
+	HideDir      bool
+	ReadOnly     bool
+	VectorBucket vectorbucket.Extension
 }
 
-type BucketResponse struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	CreatedAt string `json:"created_at"`
+type jfsObjects struct {
+	conf         *vfs.Config
+	fs           *fs.FileSystem
+	listPool     *minio.TreeWalkPool
+	nsMutex      *minio.NsLockMap
+	gConf        *Config
+	vectorbucket vectorbucket.Extension
 }
 
-func bucketToResponse(b *metadata.Bucket) BucketResponse {
-	return BucketResponse{
-		ID:        b.ID,
-		Name:      b.Name,
-		Status:    string(b.Status),
-		CreatedAt: b.CreatedAt.Format("2006-01-02T15:04:05Z"),
+func NewJFSGateway(jfs *fs.FileSystem, conf *vfs.Config, gConf *Config) (minio.ObjectLayer, error) {
+	mctx = meta.NewContext(uint32(os.Getpid()), uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
+	jfsObj := &jfsObjects{
+		fs:           jfs,
+		conf:         conf,
+		listPool:     minio.NewTreeWalkPool(time.Minute * 30),
+		gConf:        gConf,
+		nsMutex:      minio.NewNSLock(false),
+		vectorbucket: gConf.VectorBucket,
 	}
+	go jfsObj.cleanup()
+	return jfsObj, nil
 }
 
-func (s *Server) CreateBucket(c *gin.Context) {
-	var req CreateBucketRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondBadRequest(c, "invalid request: "+err.Error())
-		return
-	}
-
-	// TODO: 从鉴权上下文获取 owner；当前使用占位符
-	owner := "default"
-
-	if err := s.quota.CanCreateBucket(c.Request.Context(), owner); err != nil {
-		respondQuotaExceeded(c, err.Error())
-		return
-	}
-
-	bucket := &metadata.Bucket{
-		ID:     uuid.New().String(),
-		Name:   req.Name,
-		Owner:  owner,
-		Status: metadata.BucketStatusReady,
-	}
-
-	if err := s.store.CreateBucket(c.Request.Context(), bucket); err != nil {
-		respondError(c, http.StatusConflict, "bucket already exists or internal error: "+err.Error())
-		return
-	}
-
-	c.JSON(http.StatusCreated, bucketToResponse(bucket))
-}
-
-func (s *Server) GetBucket(c *gin.Context) {
-	bucketName := c.Param("bucket")
-
-	bucket, err := s.store.GetBucketByName(c.Request.Context(), bucketName)
-	if err != nil {
-		respondNotFound(c, "bucket not found")
-		return
-	}
-
-	c.JSON(http.StatusOK, bucketToResponse(bucket))
-}
-
-func (s *Server) DeleteBucket(c *gin.Context) {
-	bucketName := c.Param("bucket")
-
-	bucket, err := s.store.GetBucketByName(c.Request.Context(), bucketName)
-	if err != nil {
-		respondNotFound(c, "bucket not found")
-		return
-	}
-
-	// 检查 bucket 是否为空
-	cnt, err := s.store.CountCollections(c.Request.Context(), bucket.ID)
-	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to check collections")
-		return
-	}
-	if cnt > 0 {
-		respondBadRequest(c, "cannot delete non-empty bucket; delete all collections first")
-		return
-	}
-
-	if err := s.store.DeleteBucket(c.Request.Context(), bucket.ID); err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to delete bucket")
-		return
-	}
-
-	c.Status(http.StatusNoContent)
+func (n *jfsObjects) VectorBucketExtension() vectorbucket.Extension {
+	return n.vectorbucket
 }
 ```
 
-- [ ] **步骤 3: 编写 Bucket Handler 测试**
+- [ ] **步骤 3: 增加运行时挂接测试**
 
 ```go
-// internal/vectorbucket/gateway/handlers_bucket_test.go
+// pkg/gateway/vectorbucket/runtime_test.go
+package vectorbucket
+
+import "testing"
+
+func TestRuntimeImplementsExtension(t *testing.T) {
+	var _ Extension = (*Runtime)(nil)
+}
+```
+
+```go
+// pkg/gateway/gateway_test.go
 package gateway
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/controller"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
 )
 
-// testServer 创建一个使用 SQLite 存储、无真实 Milvus adapter 的 Server
-func testServer(t *testing.T) *Server {
-	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store := metadata.NewSQLiteStore(dbPath)
-	require.NoError(t, store.Init(context.Background()))
-	t.Cleanup(func() { store.Close() })
+type stubVectorExtension struct{}
 
-	cfg := config.DefaultConfig()
-	ctrl := controller.NewLoadController(nil, cfg.LoadBudgetMB, 30*60, cfg.MaxLoadedColls)
-	return NewServer(&cfg, store, nil, ctrl)
+func (stubVectorExtension) CreateVectorBucket(ctx context.Context, req *vectorbucket.CreateVectorBucketRequest) (*vectorbucket.CreateVectorBucketResponse, error) {
+	return nil, nil
+}
+func (stubVectorExtension) GetVectorBucket(ctx context.Context, req *vectorbucket.GetVectorBucketRequest) (*vectorbucket.GetVectorBucketResponse, error) {
+	return nil, nil
+}
+func (stubVectorExtension) ListVectorBuckets(ctx context.Context, req *vectorbucket.ListVectorBucketsRequest) (*vectorbucket.ListVectorBucketsResponse, error) {
+	return nil, nil
+}
+func (stubVectorExtension) DeleteVectorBucket(ctx context.Context, req *vectorbucket.DeleteVectorBucketRequest) error {
+	return nil
+}
+func (stubVectorExtension) CreateIndex(ctx context.Context, req *vectorbucket.CreateIndexRequest) (*vectorbucket.CreateIndexResponse, error) {
+	return nil, nil
+}
+func (stubVectorExtension) DeleteIndex(ctx context.Context, req *vectorbucket.DeleteIndexRequest) error {
+	return nil
+}
+func (stubVectorExtension) PutVectors(ctx context.Context, req *vectorbucket.PutVectorsRequest) error {
+	return nil
+}
+func (stubVectorExtension) DeleteVectors(ctx context.Context, req *vectorbucket.DeleteVectorsRequest) error {
+	return nil
+}
+func (stubVectorExtension) QueryVectors(ctx context.Context, req *vectorbucket.QueryVectorsRequest) (*vectorbucket.QueryVectorsResponse, error) {
+	return nil, nil
 }
 
-func TestCreateBucket(t *testing.T) {
-	s := testServer(t)
-	body, _ := json.Marshal(CreateBucketRequest{Name: "test-bucket"})
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusCreated, w.Code)
-
-	var resp BucketResponse
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, "test-bucket", resp.Name)
-	assert.Equal(t, "READY", resp.Status)
-	assert.NotEmpty(t, resp.ID)
-}
-
-func TestGetBucket(t *testing.T) {
-	s := testServer(t)
-
-	// 先创建
-	body, _ := json.Marshal(CreateBucketRequest{Name: "test-bucket"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	// 查询
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/v1/buckets/test-bucket", nil)
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	var resp BucketResponse
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, "test-bucket", resp.Name)
-}
-
-func TestGetBucketNotFound(t *testing.T) {
-	s := testServer(t)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/v1/buckets/nonexistent", nil)
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-func TestDeleteEmptyBucket(t *testing.T) {
-	s := testServer(t)
-
-	// 创建
-	body, _ := json.Marshal(CreateBucketRequest{Name: "del-bucket"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	// 删除
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/v1/buckets/del-bucket", nil)
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusNoContent, w.Code)
-}
-
-func TestDeleteBucketNotFound(t *testing.T) {
-	s := testServer(t)
-
-	w := httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/v1/buckets/does-not-exist", nil)
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusNotFound, w.Code)
+func TestGatewayCarriesVectorBucketExtension(t *testing.T) {
+	ext := stubVectorExtension{}
+	obj := &jfsObjects{gConf: &Config{VectorBucket: ext}, vectorbucket: ext}
+	require.Same(t, ext, obj.VectorBucketExtension())
 }
 ```
 
 - [ ] **步骤 4: 运行测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/gateway/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/... ./pkg/gateway/...`
 预期: PASS
 
 - [ ] **步骤 5: 提交**
 
 ```bash
-git add internal/vectorbucket/gateway/server.go internal/vectorbucket/gateway/handlers_bucket.go internal/vectorbucket/gateway/handlers_bucket_test.go
-git commit -s -m "feat(vectorbucket): add Gin server scaffold and bucket CRUD HTTP handlers
+git add pkg/gateway/gateway.go pkg/gateway/gateway_test.go pkg/gateway/vectorbucket/runtime.go pkg/gateway/vectorbucket/runtime_test.go
+git commit -s -m "feat(vectorbucket): attach runtime to jfs gateway object layer
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-## 任务 11：Collection HTTP Handler
+## 任务 11：Vector Bucket 管理协议 Shim
 
 **文件:**
-- 新建: `internal/vectorbucket/gateway/handlers_collection.go`
-- 新建: `internal/vectorbucket/gateway/handlers_collection_test.go`
+- 修改: `pkg/gateway/gateway.go`
+- 新建: `pkg/gateway/vectorbucket/bucket_service.go`
+- 新建: `pkg/gateway/vectorbucket/bucket_service_test.go`
+- 修改: `pkg/gateway/gateway_test.go`
+- 可能新增: `$JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers.go`
+- 可能新增: `$JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers_test.go`
 
-- [ ] **步骤 1: 编写 Collection Handler**
+> **实际落点修正:** 这里不应再以标准 `MakeBucketWithLocation` / `GetBucketInfo` / `DeleteBucket` 为主入口来模拟 Vector Bucket。按照 AWS 当前协议，外部能力应优先对齐 `CreateVectorBucket`、`GetVectorBucket`、`DeleteVectorBucket`、`ListVectorBuckets`。JuiceFS 侧负责承接这些操作后的 metadata 注册、ARN 生成、配额检查和删除前校验；如果 `juicedata/minio` fork 缺少这些操作的解析，则本任务要先补 shim。
+
+> **目录约束:** 这里涉及的 shim 文件位于本地 `$JUICEDATA_MINIO_ROOT/cmd/`，只作为联调目标目录，不纳入当前仓库的 git 变更范围。
+
+- [ ] **步骤 1: 在 `bucket_service.go` 实现 vector bucket 生命周期**
 
 ```go
-// internal/vectorbucket/gateway/handlers_collection.go
-package gateway
+// pkg/gateway/vectorbucket/bucket_service.go
+package vectorbucket
 
 import (
-	"net/http"
+	"context"
+	"errors"
+	"fmt"
+	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
-	"github.com/milvus-io/milvus/internal/vectorbucket/router"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
 )
 
-type CreateCollectionRequest struct {
-	Name   string `json:"name" binding:"required"`
-	Dim    int    `json:"dim" binding:"required"`
-	Metric string `json:"metric" binding:"required"`
+type BucketService struct {
+	store metadata.Store
+	quota *quota.Checker
 }
 
-type CollectionResponse struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Dim       int    `json:"dim"`
-	Metric    string `json:"metric"`
-	Status    string `json:"status"`
-	CreatedAt string `json:"created_at"`
+func NewBucketService(store metadata.Store, q *quota.Checker) *BucketService {
+	return &BucketService{store: store, quota: q}
 }
 
-func collToResponse(c *metadata.LogicalCollection) CollectionResponse {
-	return CollectionResponse{
-		ID:        c.ID,
-		Name:      c.Name,
-		Dim:       c.Dim,
-		Metric:    c.Metric,
-		Status:    string(c.Status),
-		CreatedAt: c.CreatedAt.Format("2006-01-02T15:04:05Z"),
+func (s *BucketService) CreateVectorBucket(ctx context.Context, req *CreateVectorBucketRequest) (*CreateVectorBucketResponse, error) {
+	if len(req.VectorBucketName) < 3 {
+		return nil, fmt.Errorf("%w: vectorBucketName too short", ErrValidation)
 	}
+	if err := s.quota.CanCreateBucket(ctx, req.AccountID); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
+	}
+
+	bucket := &metadata.Bucket{
+		ID:        uuid.NewString(),
+		Name:      req.VectorBucketName,
+		Owner:     req.AccountID,
+		Status:    metadata.BucketStatusReady,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.store.CreateBucket(ctx, bucket); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+	}
+	return &CreateVectorBucketResponse{
+		VectorBucketARN: fmt.Sprintf("arn:aws:s3vectors:%s:%s:bucket/%s", req.Region, req.AccountID, req.VectorBucketName),
+	}, nil
 }
 
-func (s *Server) CreateCollection(c *gin.Context) {
-	bucketName := c.Param("bucket")
-	ctx := c.Request.Context()
-
-	var req CreateCollectionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondBadRequest(c, "invalid request: "+err.Error())
-		return
+func (s *BucketService) GetVectorBucket(ctx context.Context, req *GetVectorBucketRequest) (*GetVectorBucketResponse, error) {
+	bucketName, _, err := req.Target.ResolveNames()
+	if err != nil {
+		return nil, err
 	}
-
-	if err := s.quota.CheckDimension(req.Dim); err != nil {
-		respondBadRequest(c, err.Error())
-		return
-	}
-	if err := s.quota.CheckMetric(req.Metric); err != nil {
-		respondBadRequest(c, err.Error())
-		return
-	}
-
 	bucket, err := s.store.GetBucketByName(ctx, bucketName)
 	if err != nil {
-		respondNotFound(c, "bucket not found")
+		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	return &GetVectorBucketResponse{
+		VectorBucketARN:  fmt.Sprintf("arn:aws:s3vectors:%s:%s:bucket/%s", req.Region, req.AccountID, bucket.Name),
+		VectorBucketName: bucket.Name,
+		CreationTime:     bucket.CreatedAt.UTC().Format(time.RFC3339),
+	}, nil
+}
+
+func (s *BucketService) ListVectorBuckets(ctx context.Context, req *ListVectorBucketsRequest) (*ListVectorBucketsResponse, error) {
+	rows, err := s.store.ListBuckets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+	resp := &ListVectorBucketsResponse{VectorBuckets: make([]VectorBucketSummary, 0, len(rows))}
+	for _, bucket := range rows {
+		resp.VectorBuckets = append(resp.VectorBuckets, VectorBucketSummary{
+			VectorBucketARN:  fmt.Sprintf("arn:aws:s3vectors:%s:%s:bucket/%s", req.Region, req.AccountID, bucket.Name),
+			VectorBucketName: bucket.Name,
+			CreationTime:     bucket.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return resp, nil
+}
+
+func (s *BucketService) DeleteVectorBucket(ctx context.Context, req *DeleteVectorBucketRequest) error {
+	bucketName, _, err := req.Target.ResolveNames()
+	if err != nil {
+		return err
+	}
+	bucket, err := s.store.GetBucketByName(ctx, bucketName)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	count, err := s.store.CountCollections(ctx, bucket.ID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+	if count > 0 {
+		return errors.Join(ErrConflict, errors.New("delete all vector indexes before deleting the vector bucket"))
+	}
+	if err := s.store.DeleteBucket(ctx, bucket.ID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+	return nil
+}
+```
+
+- [ ] **步骤 2: 在 `juicedata/minio` shim 注册 bucket 级协议入口**
+
+```go
+// $JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers.go
+package cmd
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
+)
+
+func registerS3VectorsHandlers(router *mux.Router, api objectAPIHandlers) {
+	router.Methods(http.MethodPost).Path("/CreateVectorBucket").HandlerFunc(api.CreateVectorBucketHandler)
+	router.Methods(http.MethodPost).Path("/GetVectorBucket").HandlerFunc(api.GetVectorBucketHandler)
+	router.Methods(http.MethodPost).Path("/ListVectorBuckets").HandlerFunc(api.ListVectorBucketsHandler)
+	router.Methods(http.MethodPost).Path("/DeleteVectorBucket").HandlerFunc(api.DeleteVectorBucketHandler)
+}
+
+func (api objectAPIHandlers) vectorExtension() (vectorbucket.Extension, error) {
+	objAPI := api.ObjectAPI()
+	provider, ok := objAPI.(interface{ VectorBucketExtension() vectorbucket.Extension })
+	if !ok || provider.VectorBucketExtension() == nil {
+		return nil, errVectorBucketNotEnabled
+	}
+	return provider.VectorBucketExtension(), nil
+}
+
+func (api objectAPIHandlers) CreateVectorBucketHandler(w http.ResponseWriter, r *http.Request) {
+	var req vectorbucket.CreateVectorBucketRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(vectorbucket.ErrValidation))
 		return
 	}
+	req.RequestID = mustGetRequestID(r)
+	req.Region = globalSite.Region()
+	req.AccountID = mustResolveAccountID(r)
 
+	ext, err := api.vectorExtension()
+	if err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(err))
+		return
+	}
+	resp, err := ext.CreateVectorBucket(r.Context(), &req)
+	if err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(err))
+		return
+	}
+	writeVectorJSON(w, http.StatusOK, resp)
+}
+```
+
+- [ ] **步骤 3: 增加 bucket 生命周期测试**
+
+```go
+// pkg/gateway/vectorbucket/bucket_service_test.go
+package vectorbucket
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
+)
+
+func TestBucketServiceLifecycle(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "vectorbucket.db")
+	store := metadata.NewSQLiteStore(db)
+	require.NoError(t, store.Init(context.Background()))
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := config.DefaultConfig()
+	svc := NewBucketService(store, quota.NewChecker(store, &cfg))
+
+	createResp, err := svc.CreateVectorBucket(context.Background(), &CreateVectorBucketRequest{
+		RequestContext:   RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		VectorBucketName: "demo-bucket",
+	})
+	require.NoError(t, err)
+	require.Contains(t, createResp.VectorBucketARN, "bucket/demo-bucket")
+
+	getResp, err := svc.GetVectorBucket(context.Background(), &GetVectorBucketRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         Target{VectorBucketName: "demo-bucket"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "demo-bucket", getResp.VectorBucketName)
+
+	listResp, err := svc.ListVectorBuckets(context.Background(), &ListVectorBucketsRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+	})
+	require.NoError(t, err)
+	require.Len(t, listResp.VectorBuckets, 1)
+
+	require.NoError(t, svc.DeleteVectorBucket(context.Background(), &DeleteVectorBucketRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         Target{VectorBucketName: "demo-bucket"},
+	}))
+}
+```
+
+- [ ] **步骤 4: 运行测试**
+
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/... ./pkg/gateway/...`
+预期: PASS
+
+- [ ] **步骤 5: 提交**
+
+```bash
+git add pkg/gateway/gateway_test.go pkg/gateway/vectorbucket/bucket_service.go pkg/gateway/vectorbucket/bucket_service_test.go
+git commit -s -m "feat(vectorbucket): add vector bucket lifecycle service and shim hooks
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+```
+
+---
+
+## 任务 12：Index 管理与写入协议 Shim（CreateIndex / DeleteIndex / PutVectors / DeleteVectors）
+
+**文件:**
+- 修改: `pkg/gateway/gateway.go`
+- 新建: `pkg/gateway/vectorbucket/object_service.go`
+- 新建: `pkg/gateway/vectorbucket/object_service_test.go`
+- 修改: `pkg/gateway/gateway_test.go`
+- 可能新增: `$JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers.go`
+
+> **实际落点修正:** AWS 当前写入主路径不是普通 `PutObject`，而是 `CreateIndex`、`DeleteIndex`、`PutVectors`、`DeleteVectors` 这些独立操作。因此本任务应优先设计并实现这些操作的 shim 和 JuiceFS runtime 对接；只有在内部需要落地 metadata/tagging/持久化信息时，才复用普通对象接口。不要把向量写入错误地等同于通用对象上传。
+
+> **内部术语对齐:** 这里的 AWS `Index` 在 Phase 1 内部继续复用现有 `metadata.LogicalCollection` 模型；也就是说 `LogicalCollection.Name == indexName`，`LogicalCollection.PhysicalName` 是 Milvus 真正 collection 名。
+
+- [ ] **步骤 1: 在 `object_service.go` 实现 `CreateIndex/DeleteIndex/PutVectors/DeleteVectors`**
+
+```go
+// pkg/gateway/vectorbucket/object_service.go
+package vectorbucket
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/adapter"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
+)
+
+type ObjectService struct {
+	store      metadata.Store
+	router     *router.NamespaceRouter
+	adapter    adapter.Adapter
+	controller *controller.LoadController
+	quota      *quota.Checker
+	cfg        config.Config
+}
+
+func NewObjectService(store metadata.Store, ns *router.NamespaceRouter, milvus adapter.Adapter, ctrl *controller.LoadController, q *quota.Checker, cfg config.Config) *ObjectService {
+	return &ObjectService{store: store, router: ns, adapter: milvus, controller: ctrl, quota: q, cfg: cfg}
+}
+
+func (s *ObjectService) CreateIndex(ctx context.Context, req *CreateIndexRequest) (*CreateIndexResponse, error) {
+	if req.DataType != "float32" {
+		return nil, fmt.Errorf("%w: dataType must be float32", ErrValidation)
+	}
+	if req.Dimension < 1 || req.Dimension > 4096 {
+		return nil, fmt.Errorf("%w: dimension out of range", ErrValidation)
+	}
+	if req.DistanceMetric != "cosine" && req.DistanceMetric != "euclidean" {
+		return nil, fmt.Errorf("%w: unsupported distanceMetric", ErrValidation)
+	}
+
+	bucketName, _, err := req.Target.ResolveNames()
+	if err != nil {
+		return nil, err
+	}
+	bucket, err := s.store.GetBucketByName(ctx, bucketName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
 	if err := s.quota.CanCreateCollection(ctx, bucket.ID); err != nil {
-		respondQuotaExceeded(c, err.Error())
-		return
+		return nil, fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
 	}
 
-	collID := uuid.New().String()
-	physName := router.PhysicalCollectionName(bucket.ID, collID)
-
-	lc := &metadata.LogicalCollection{
-		ID:           collID,
+	indexID := uuid.NewString()
+	physicalName := router.PhysicalCollectionName(bucket.ID, indexID)
+	indexMeta := &metadata.LogicalCollection{
+		ID:           indexID,
 		BucketID:     bucket.ID,
-		Name:         req.Name,
-		Dim:          req.Dim,
-		Metric:       req.Metric,
+		Name:         req.IndexName,
+		Dim:          req.Dimension,
+		Metric:       strings.ToUpper(req.DistanceMetric),
 		Status:       metadata.CollStatusInit,
-		PhysicalName: physName,
+		PhysicalName: physicalName,
 	}
-
-	if err := s.store.CreateCollection(ctx, lc); err != nil {
-		respondError(c, http.StatusConflict, "collection already exists: "+err.Error())
-		return
+	if err := s.store.CreateCollection(ctx, indexMeta); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
 	}
-
-	// 创建物理 Milvus collection（不建索引）
 	if s.adapter != nil {
-		if err := s.adapter.CreateCollection(ctx, physName, req.Dim, req.Metric); err != nil {
-			// 回滚 metadata
-			s.store.DeleteCollection(ctx, collID)
-			respondError(c, http.StatusInternalServerError, "failed to create Milvus collection: "+err.Error())
-			return
+		if err := s.adapter.CreateCollection(ctx, physicalName, req.Dimension, indexMeta.Metric); err != nil {
+			_ = s.store.DeleteCollection(ctx, indexID)
+			return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 		}
 	}
-
-	if err := s.store.UpdateCollectionStatus(ctx, collID, metadata.CollStatusReady); err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to update status")
-		return
+	if err := s.store.UpdateCollectionStatus(ctx, indexID, metadata.CollStatusReady); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
-	lc.Status = metadata.CollStatusReady
-
-	c.JSON(http.StatusCreated, collToResponse(lc))
+	return &CreateIndexResponse{
+		IndexARN: fmt.Sprintf("arn:aws:s3vectors:%s:%s:bucket/%s/index/%s", req.Region, req.AccountID, bucketName, req.IndexName),
+	}, nil
 }
 
-func (s *Server) DeleteCollection(c *gin.Context) {
-	bucketName := c.Param("bucket")
-	collName := c.Param("collection")
-	ctx := c.Request.Context()
-
-	bucket, err := s.store.GetBucketByName(ctx, bucketName)
+func (s *ObjectService) DeleteIndex(ctx context.Context, req *DeleteIndexRequest) error {
+	bucketName, indexName, err := req.Target.ResolveNames()
 	if err != nil {
-		respondNotFound(c, "bucket not found")
-		return
+		return err
 	}
-
-	coll, err := s.store.GetCollection(ctx, bucket.ID, collName)
+	indexMeta, err := s.router.Resolve(ctx, bucketName, indexName)
 	if err != nil {
-		respondNotFound(c, "collection not found")
-		return
+		return fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
-
-	// 标记为删除中
-	s.store.UpdateCollectionStatus(ctx, coll.ID, metadata.CollStatusDeleting)
-
-	// 在 Milvus 中 release + drop
+	_ = s.store.UpdateCollectionStatus(ctx, indexMeta.ID, metadata.CollStatusDeleting)
 	if s.adapter != nil {
-		_ = s.adapter.ReleaseCollection(ctx, coll.PhysicalName)
-		_ = s.adapter.DropCollection(ctx, coll.PhysicalName)
+		_ = s.adapter.ReleaseCollection(ctx, indexMeta.PhysicalName)
+		_ = s.adapter.DropCollection(ctx, indexMeta.PhysicalName)
+	}
+	if err := s.store.DeleteCollection(ctx, indexMeta.ID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+	return nil
+}
+
+func (s *ObjectService) PutVectors(ctx context.Context, req *PutVectorsRequest) error {
+	if len(req.Vectors) == 0 || len(req.Vectors) > 500 {
+		return fmt.Errorf("%w: vectors length must be between 1 and 500", ErrValidation)
+	}
+	bucketName, indexName, err := req.Target.ResolveNames()
+	if err != nil {
+		return err
+	}
+	indexMeta, err := s.router.Resolve(ctx, bucketName, indexName)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
 
-	// 标记已删除
-	s.store.UpdateCollectionStatus(ctx, coll.ID, metadata.CollStatusDeleted)
+	ids := make([]string, 0, len(req.Vectors))
+	data := make([][]float32, 0, len(req.Vectors))
+	metaJSON := make([][]byte, 0, len(req.Vectors))
+	for _, item := range req.Vectors {
+		if len(item.Data.Float32) != indexMeta.Dim {
+			return fmt.Errorf("%w: vector dimension mismatch", ErrValidation)
+		}
+		ids = append(ids, item.Key)
+		data = append(data, item.Data.Float32)
+		metaJSON = append(metaJSON, item.Metadata)
+	}
 
-	c.Status(http.StatusNoContent)
+	if err := s.quota.CheckVectorCount(indexMeta.VectorCount, len(req.Vectors)); err != nil {
+		return fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
+	}
+	if s.adapter != nil {
+		if err := s.adapter.Insert(ctx, indexMeta.PhysicalName, ids, data, metaJSON, nil); err != nil {
+			return fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+		}
+	}
+	_ = s.store.UpdateCollectionVectorCount(ctx, indexMeta.ID, int64(len(req.Vectors)))
+	return nil
+}
+
+func (s *ObjectService) DeleteVectors(ctx context.Context, req *DeleteVectorsRequest) error {
+	if len(req.Keys) == 0 {
+		return fmt.Errorf("%w: keys cannot be empty", ErrValidation)
+	}
+	bucketName, indexName, err := req.Target.ResolveNames()
+	if err != nil {
+		return err
+	}
+	indexMeta, err := s.router.Resolve(ctx, bucketName, indexName)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	if s.adapter != nil {
+		if err := s.adapter.Delete(ctx, indexMeta.PhysicalName, req.Keys); err != nil {
+			return fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+		}
+	}
+	_ = s.store.UpdateCollectionVectorCount(ctx, indexMeta.ID, -int64(len(req.Keys)))
+	return nil
 }
 ```
 
-- [ ] **步骤 2: 编写 Collection Handler 测试**
+- [ ] **步骤 2: 在 shim 注册 index 和 vector 写入入口**
 
 ```go
-// internal/vectorbucket/gateway/handlers_collection_test.go
-package gateway
-
-import (
-	"bytes"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-)
-
-func createTestBucket(t *testing.T, s *Server, name string) {
-	t.Helper()
-	body, _ := json.Marshal(CreateBucketRequest{Name: name})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
+// $JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers.go
+func registerS3VectorsHandlers(router *mux.Router, api objectAPIHandlers) {
+	router.Methods(http.MethodPost).Path("/CreateIndex").HandlerFunc(api.CreateIndexHandler)
+	router.Methods(http.MethodPost).Path("/DeleteIndex").HandlerFunc(api.DeleteIndexHandler)
+	router.Methods(http.MethodPost).Path("/PutVectors").HandlerFunc(api.PutVectorsHandler)
+	router.Methods(http.MethodPost).Path("/DeleteVectors").HandlerFunc(api.DeleteVectorsHandler)
 }
 
-func TestCreateCollection(t *testing.T) {
-	s := testServer(t)
-	createTestBucket(t, s, "bkt")
+func (api objectAPIHandlers) PutVectorsHandler(w http.ResponseWriter, r *http.Request) {
+	var req vectorbucket.PutVectorsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(vectorbucket.ErrValidation))
+		return
+	}
+	req.RequestID = mustGetRequestID(r)
+	req.Region = globalSite.Region()
+	req.AccountID = mustResolveAccountID(r)
 
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "my-coll", Dim: 768, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusCreated, w.Code)
-	var resp CollectionResponse
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, "my-coll", resp.Name)
-	assert.Equal(t, 768, resp.Dim)
-	assert.Equal(t, "COSINE", resp.Metric)
-	assert.Equal(t, "READY", resp.Status)
-}
-
-func TestCreateCollectionBadDim(t *testing.T) {
-	s := testServer(t)
-	createTestBucket(t, s, "bkt")
-
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "c", Dim: 9999, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestCreateCollectionBadMetric(t *testing.T) {
-	s := testServer(t)
-	createTestBucket(t, s, "bkt")
-
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "c", Dim: 768, Metric: "INVALID"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestCreateCollectionBucketNotFound(t *testing.T) {
-	s := testServer(t)
-
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "c", Dim: 768, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/nonexistent/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-func TestDeleteCollection(t *testing.T) {
-	s := testServer(t)
-	createTestBucket(t, s, "bkt")
-
-	// 创建 collection
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "del-coll", Dim: 768, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	// 删除 collection
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/v1/buckets/bkt/collections/del-coll", nil)
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusNoContent, w.Code)
-}
-
-func TestDeleteNonEmptyBucketFails(t *testing.T) {
-	s := testServer(t)
-	createTestBucket(t, s, "bkt")
-
-	// 创建 collection
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "coll", Dim: 768, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	// 尝试删除非空 bucket
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/v1/buckets/bkt", nil)
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	ext, err := api.vectorExtension()
+	if err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(err))
+		return
+	}
+	if err := ext.PutVectors(r.Context(), &req); err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(err))
+		return
+	}
+	writeVectorJSON(w, http.StatusOK, struct{}{})
 }
 ```
 
-- [ ] **步骤 3: 运行测试**
+- [ ] **步骤 3: 增加 index 和写入测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/gateway/...`
+```go
+// pkg/gateway/vectorbucket/object_service_test.go
+package vectorbucket
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
+)
+
+func TestObjectServiceCreateIndexAndPutVectors(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "vectorbucket.db")
+	store := metadata.NewSQLiteStore(db)
+	require.NoError(t, store.Init(context.Background()))
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := config.DefaultConfig()
+	bucketSvc := NewBucketService(store, quota.NewChecker(store, &cfg))
+	_, err := bucketSvc.CreateVectorBucket(context.Background(), &CreateVectorBucketRequest{
+		RequestContext:   RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		VectorBucketName: "demo-bucket",
+	})
+	require.NoError(t, err)
+
+	objSvc := NewObjectService(store, router.NewNamespaceRouter(store), nil, nil, quota.NewChecker(store, &cfg), cfg)
+	indexResp, err := objSvc.CreateIndex(context.Background(), &CreateIndexRequest{
+		RequestContext:   RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:           Target{VectorBucketName: "demo-bucket"},
+		IndexName:        "demo-index",
+		DataType:         "float32",
+		Dimension:        4,
+		DistanceMetric:   "cosine",
+	})
+	require.NoError(t, err)
+	require.Contains(t, indexResp.IndexARN, "/index/demo-index")
+
+	err = objSvc.PutVectors(context.Background(), &PutVectorsRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+		Vectors: []PutInputVector{
+			{Key: "v1", Data: VectorData{Float32: []float32{0.1, 0.2, 0.3, 0.4}}, Metadata: json.RawMessage(`{"tag":"a"}`)},
+			{Key: "v2", Data: VectorData{Float32: []float32{0.4, 0.3, 0.2, 0.1}}},
+		},
+	})
+	require.NoError(t, err)
+
+	err = objSvc.DeleteVectors(context.Background(), &DeleteVectorsRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+		Keys:           []string{"v1"},
+	})
+	require.NoError(t, err)
+}
+```
+
+- [ ] **步骤 4: 运行测试**
+
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/... ./pkg/gateway/...`
 预期: PASS
 
-- [ ] **步骤 4: 提交**
+- [ ] **步骤 5: 提交**
 
 ```bash
-git add internal/vectorbucket/gateway/handlers_collection.go internal/vectorbucket/gateway/handlers_collection_test.go
-git commit -s -m "feat(vectorbucket): add collection create/delete HTTP handlers with quota checks
+git add pkg/gateway/gateway_test.go pkg/gateway/vectorbucket/object_service.go pkg/gateway/vectorbucket/object_service_test.go
+git commit -s -m "feat(vectorbucket): add index lifecycle and vector write service
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-## 任务 12：Vector 写入 Handler（Put / Upsert / Delete）
+## 任务 13：`QueryVectors` 协议 Shim（含 Load/Release 集成）
 
 **文件:**
-- 新建: `internal/vectorbucket/gateway/handlers_vector.go`
-- 新建: `internal/vectorbucket/gateway/handlers_vector_test.go`
+- 新建: `pkg/gateway/vectorbucket/query_service.go`
+- 新建: `pkg/gateway/vectorbucket/query_service_test.go`
+- 新建: `pkg/gateway/vectorbucket/filter/translator.go`
+- 新建: `pkg/gateway/vectorbucket/filter/translator_test.go`
+- 可能修改: `$JUICEDATA_MINIO_ROOT/cmd/<protocol shim>`
+- 修改: `pkg/gateway/vectorbucket/protocol.go`
 
-- [ ] **步骤 1: 编写 Vector Handler**
+> **实际落点修正:** AWS 当前查询主路径是独立的 `POST /QueryVectors` JSON API，而不是普通对象读路径。因此本任务应默认需要 `juicedata/minio` shim；只有在确认 fork 已经内置这组操作时，才可以直接接 runtime。JuiceFS 仓库负责实现 query service、Load/Release、Milvus search 编排，并对齐 `topK`、`returnDistance`、`returnMetadata`、metadata filter 等关键字段。
 
-```go
-// internal/vectorbucket/gateway/handlers_vector.go
-package gateway
+> **目录约束:** 查询协议 shim 仍然改本地 `$JUICEDATA_MINIO_ROOT/cmd/`；当前仓库只记录 JuiceFS 侧改动和对应计划，不把 minio 代码纳入本仓版本管理。
 
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"time"
-
-	"github.com/gin-gonic/gin"
-
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metrics"
-)
-
-type VectorEntry struct {
-	ID       string          `json:"id" binding:"required"`
-	Vector   []float32       `json:"vector" binding:"required"`
-	Metadata json.RawMessage `json:"metadata"`
-}
-
-type PutVectorsRequest struct {
-	Vectors []VectorEntry `json:"vectors" binding:"required,dive"`
-}
-
-type DeleteVectorsRequest struct {
-	IDs    []string `json:"ids"`
-	Filter string   `json:"filter"`
-}
-
-func (s *Server) PutVectors(c *gin.Context) {
-	s.writeVectors(c, false)
-}
-
-func (s *Server) UpsertVectors(c *gin.Context) {
-	s.writeVectors(c, true)
-}
-
-func (s *Server) writeVectors(c *gin.Context, upsert bool) {
-	bucketName := c.Param("bucket")
-	collName := c.Param("collection")
-	ctx := c.Request.Context()
-
-	var req PutVectorsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondBadRequest(c, "invalid request: "+err.Error())
-		return
-	}
-
-	if len(req.Vectors) == 0 {
-		respondBadRequest(c, "vectors array cannot be empty")
-		return
-	}
-
-	lc, err := s.router.Resolve(ctx, bucketName, collName)
-	if err != nil {
-		respondNotFound(c, err.Error())
-		return
-	}
-
-	// 验证维度
-	for _, v := range req.Vectors {
-		if len(v.Vector) != lc.Dim {
-			respondBadRequest(c, fmt.Sprintf("vector dimension mismatch: expected %d, got %d", lc.Dim, len(v.Vector)))
-			return
-		}
-	}
-
-	// 配额检查
-	if !upsert {
-		if err := s.quota.CheckVectorCount(lc.VectorCount, len(req.Vectors)); err != nil {
-			respondQuotaExceeded(c, err.Error())
-			return
-		}
-	}
-
-	// 准备批量数据
-	ids := make([]string, len(req.Vectors))
-	vectors := make([][]float32, len(req.Vectors))
-	metadataBytes := make([][]byte, len(req.Vectors))
-	timestamps := make([]int64, len(req.Vectors))
-	now := time.Now().UnixMilli()
-
-	for i, v := range req.Vectors {
-		ids[i] = v.ID
-		vectors[i] = v.Vector
-		if v.Metadata != nil {
-			metadataBytes[i] = []byte(v.Metadata)
-		} else {
-			metadataBytes[i] = []byte("{}")
-		}
-		timestamps[i] = now
-	}
-
-	if s.adapter != nil {
-		if upsert {
-			err = s.adapter.Upsert(ctx, lc.PhysicalName, ids, vectors, metadataBytes, timestamps)
-		} else {
-			err = s.adapter.Insert(ctx, lc.PhysicalName, ids, vectors, metadataBytes, timestamps)
-		}
-		if err != nil {
-			respondError(c, http.StatusInternalServerError, "write failed: "+err.Error())
-			return
-		}
-	}
-
-	// 更新向量计数
-	if !upsert {
-		s.store.UpdateCollectionVectorCount(ctx, lc.ID, int64(len(req.Vectors)))
-	}
-
-	// 累积达到阈值后触发异步建索引
-	if !lc.IndexBuilt {
-		newCount := lc.VectorCount + int64(len(req.Vectors))
-		if newCount >= int64(s.cfg.IndexBuildThreshold) {
-			go s.buildIndex(lc)
-		}
-	}
-
-	metrics.InsertTotal.WithLabelValues(bucketName, collName).Add(float64(len(req.Vectors)))
-	c.JSON(http.StatusOK, gin.H{"inserted": len(req.Vectors)})
-}
-
-func (s *Server) buildIndex(lc *metadata.LogicalCollection) {
-	if s.adapter == nil {
-		return
-	}
-	ctx := context.Background()
-	if err := s.adapter.CreateIndex(ctx, lc.PhysicalName, lc.VectorCount, lc.Metric); err != nil {
-		return
-	}
-	s.store.UpdateCollectionIndexBuilt(ctx, lc.ID, true)
-}
-
-func (s *Server) DeleteVectors(c *gin.Context) {
-	bucketName := c.Param("bucket")
-	collName := c.Param("collection")
-	ctx := c.Request.Context()
-
-	var req DeleteVectorsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondBadRequest(c, "invalid request: "+err.Error())
-		return
-	}
-
-	if len(req.IDs) == 0 && req.Filter == "" {
-		respondBadRequest(c, "must provide ids or filter")
-		return
-	}
-
-	lc, err := s.router.Resolve(ctx, bucketName, collName)
-	if err != nil {
-		respondNotFound(c, err.Error())
-		return
-	}
-
-	if s.adapter != nil && len(req.IDs) > 0 {
-		if err := s.adapter.Delete(ctx, lc.PhysicalName, req.IDs); err != nil {
-			respondError(c, http.StatusInternalServerError, "delete failed: "+err.Error())
-			return
-		}
-		s.store.UpdateCollectionVectorCount(ctx, lc.ID, -int64(len(req.IDs)))
-	}
-
-	c.JSON(http.StatusOK, gin.H{"deleted": len(req.IDs)})
-}
-```
-
-- [ ] **步骤 2: 编写测试（无真实 Milvus — adapter=nil 路径）**
+- [ ] **步骤 1: 在 `filter/translator.go` 把 JSON filter 归一到 Milvus 表达式**
 
 ```go
-// internal/vectorbucket/gateway/handlers_vector_test.go
-package gateway
-
-import (
-	"bytes"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-)
-
-func setupBucketAndColl(t *testing.T, s *Server) {
-	t.Helper()
-	createTestBucket(t, s, "bkt")
-
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "coll", Dim: 3, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-}
-
-func TestPutVectors(t *testing.T) {
-	s := testServer(t)
-	setupBucketAndColl(t, s)
-
-	body, _ := json.Marshal(PutVectorsRequest{
-		Vectors: []VectorEntry{
-			{ID: "v1", Vector: []float32{0.1, 0.2, 0.3}, Metadata: json.RawMessage(`{"key":"val"}`)},
-			{ID: "v2", Vector: []float32{0.4, 0.5, 0.6}},
-		},
-	})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/vectors", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-func TestPutVectorsDimMismatch(t *testing.T) {
-	s := testServer(t)
-	setupBucketAndColl(t, s)
-
-	body, _ := json.Marshal(PutVectorsRequest{
-		Vectors: []VectorEntry{
-			{ID: "v1", Vector: []float32{0.1, 0.2}}, // dim=2，期望 3
-		},
-	})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/vectors", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestPutVectorsCollectionNotFound(t *testing.T) {
-	s := testServer(t)
-	createTestBucket(t, s, "bkt")
-
-	body, _ := json.Marshal(PutVectorsRequest{
-		Vectors: []VectorEntry{
-			{ID: "v1", Vector: []float32{0.1, 0.2, 0.3}},
-		},
-	})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections/no-coll/vectors", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-func TestDeleteVectors(t *testing.T) {
-	s := testServer(t)
-	setupBucketAndColl(t, s)
-
-	body, _ := json.Marshal(DeleteVectorsRequest{IDs: []string{"v1", "v2"}})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/vectors:delete", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-func TestDeleteVectorsNoIDsOrFilter(t *testing.T) {
-	s := testServer(t)
-	setupBucketAndColl(t, s)
-
-	body, _ := json.Marshal(DeleteVectorsRequest{})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/vectors:delete", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-```
-
-- [ ] **步骤 3: 运行测试**
-
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/gateway/...`
-预期: PASS
-
-- [ ] **步骤 4: 提交**
-
-```bash
-git add internal/vectorbucket/gateway/handlers_vector.go internal/vectorbucket/gateway/handlers_vector_test.go
-git commit -s -m "feat(vectorbucket): add vector put/upsert/delete HTTP handlers with dim validation
-
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
-```
-
----
-
-## 任务 13：Query Handler（含 Load/Release 集成）
-
-**文件:**
-- 新建: `internal/vectorbucket/gateway/handlers_query.go`
-- 新建: `internal/vectorbucket/gateway/handlers_query_test.go`
-
-- [ ] **步骤 1: 编写查询 Handler**
-
-```go
-// internal/vectorbucket/gateway/handlers_query.go
-package gateway
+// pkg/gateway/vectorbucket/filter/translator.go
+package filter
 
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"time"
-
-	"github.com/gin-gonic/gin"
-
-	"github.com/milvus-io/milvus/internal/vectorbucket/controller"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metrics"
 )
 
-type QueryRequest struct {
-	Vector []float32 `json:"vector" binding:"required"`
-	TopK   int       `json:"topK" binding:"required"`
-	Filter string    `json:"filter"`
-	Nprobe int       `json:"nprobe"`
-}
-
-type QueryResultItem struct {
-	ID       string          `json:"id"`
-	Score    float32         `json:"score"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
-}
-
-func (s *Server) QueryVectors(c *gin.Context) {
-	bucketName := c.Param("bucket")
-	collName := c.Param("collection")
-	ctx := c.Request.Context()
-
-	var req QueryRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondBadRequest(c, "invalid request: "+err.Error())
-		return
+func Translate(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
 	}
 
-	if req.TopK < 1 || req.TopK > 30 {
-		respondBadRequest(c, "topK must be between 1 and 30")
-		return
-	}
-	if req.Nprobe <= 0 {
-		req.Nprobe = 16 // 默认值
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return "", err
 	}
 
-	lc, err := s.router.Resolve(ctx, bucketName, collName)
-	if err != nil {
-		respondNotFound(c, err.Error())
-		return
+	field, ok := doc["field"].(string)
+	if !ok || field == "" {
+		return "", fmt.Errorf("filter.field is required")
+	}
+	op, ok := doc["op"].(string)
+	if !ok || op == "" {
+		return "", fmt.Errorf("filter.op is required")
 	}
 
-	if len(req.Vector) != lc.Dim {
-		respondBadRequest(c, fmt.Sprintf("query vector dimension mismatch: expected %d, got %d", lc.Dim, len(req.Vector)))
-		return
-	}
-
-	// 确保 collection 已 load
-	estMem := controller.EstimateMemMB(lc.VectorCount, lc.Dim)
-	loadStart := time.Now()
-	if err := s.controller.EnsureLoaded(ctx, lc.PhysicalName, estMem); err != nil {
-		respondServiceUnavailable(c, "load failed: "+err.Error(), 5)
-		return
-	}
-	loadDur := time.Since(loadStart)
-	if loadDur > 100*time.Millisecond {
-		metrics.LoadDuration.Observe(loadDur.Seconds())
-	}
-
-	// 追踪 in-flight 查询
-	s.controller.InFlightInc(lc.PhysicalName)
-	defer s.controller.InFlightDec(lc.PhysicalName)
-	s.controller.Touch(lc.PhysicalName)
-
-	// 更新 metadata 中的最近访问时间
-	s.store.UpdateCollectionLastAccess(ctx, lc.ID)
-
-	if s.adapter == nil {
-		// 无 Milvus adapter — 返回空结果（测试模式）
-		c.JSON(http.StatusOK, []QueryResultItem{})
-		return
-	}
-
-	searchStart := time.Now()
-	results, err := s.adapter.Search(ctx, lc.PhysicalName, req.Vector, req.TopK, req.Nprobe, req.Filter, lc.Metric)
-	searchDur := time.Since(searchStart)
-	metrics.QueryDuration.WithLabelValues("search").Observe(searchDur.Seconds())
-
-	if err != nil {
-		respondError(c, http.StatusInternalServerError, "search failed: "+err.Error())
-		return
-	}
-
-	out := make([]QueryResultItem, len(results))
-	for i, r := range results {
-		out[i] = QueryResultItem{
-			ID:       r.ID,
-			Score:    r.Score,
-			Metadata: json.RawMessage(r.Metadata),
+	switch op {
+	case "eq":
+		return fmt.Sprintf("metadata_%s == %q", field, doc["value"]), nil
+	case "in":
+		rawValues, ok := doc["value"].([]any)
+		if !ok {
+			return "", fmt.Errorf("filter.value must be array for op=in")
 		}
+		return fmt.Sprintf("metadata_%s in %v", field, rawValues), nil
+	default:
+		return "", fmt.Errorf("unsupported filter op %q", op)
 	}
-
-	metrics.QueryTotal.WithLabelValues(bucketName, collName).Inc()
-	c.JSON(http.StatusOK, out)
 }
 ```
 
-- [ ] **步骤 2: 编写查询 Handler 测试**
+- [ ] **步骤 2: 在 `query_service.go` 接入 filter 翻译、Load/Release 和返回裁剪**
 
 ```go
-// internal/vectorbucket/gateway/handlers_query_test.go
-package gateway
+// pkg/gateway/vectorbucket/query_service.go
+package vectorbucket
 
 import (
-	"bytes"
+	"context"
+	"fmt"
+	"strings"
+
+	vbfilter "github.com/juicedata/juicefs/pkg/gateway/vectorbucket/filter"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/adapter"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
+)
+
+type QueryService struct {
+	store      metadata.Store
+	router     *router.NamespaceRouter
+	adapter    adapter.Adapter
+	controller *controller.LoadController
+}
+
+func NewQueryService(store metadata.Store, ns *router.NamespaceRouter, milvus adapter.Adapter, ctrl *controller.LoadController) *QueryService {
+	return &QueryService{store: store, router: ns, adapter: milvus, controller: ctrl}
+}
+
+func (s *QueryService) QueryVectors(ctx context.Context, req *QueryVectorsRequest) (*QueryVectorsResponse, error) {
+	if req.TopK < 1 {
+		return nil, fmt.Errorf("%w: topK must be >= 1", ErrValidation)
+	}
+	bucketName, indexName, err := req.Target.ResolveNames()
+	if err != nil {
+		return nil, err
+	}
+	indexMeta, err := s.router.Resolve(ctx, bucketName, indexName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	if len(req.QueryVector.Float32) != indexMeta.Dim {
+		return nil, fmt.Errorf("%w: queryVector dimension mismatch", ErrValidation)
+	}
+
+	filterExpr, err := vbfilter.Translate(req.Filter)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrValidation, err)
+	}
+
+	estMem := controller.EstimateMemMB(indexMeta.VectorCount, indexMeta.Dim)
+	if err := s.controller.EnsureLoaded(ctx, indexMeta.PhysicalName, estMem); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+	}
+	s.controller.InFlightInc(indexMeta.PhysicalName)
+	defer s.controller.InFlightDec(indexMeta.PhysicalName)
+	s.controller.Touch(indexMeta.PhysicalName)
+	_ = s.store.UpdateCollectionLastAccess(ctx, indexMeta.ID)
+
+	if s.adapter == nil {
+		return &QueryVectorsResponse{DistanceMetric: strings.ToLower(indexMeta.Metric), Vectors: []QueryResultVector{}}, nil
+	}
+
+	rows, err := s.adapter.Search(ctx, indexMeta.PhysicalName, req.QueryVector.Float32, req.TopK, 16, filterExpr, indexMeta.Metric)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+	}
+
+	out := make([]QueryResultVector, 0, len(rows))
+	for _, row := range rows {
+		item := QueryResultVector{Key: row.ID}
+		if req.ReturnDistance {
+			item.Distance = row.Score
+		}
+		if req.ReturnMetadata {
+			item.Metadata = row.Metadata
+		}
+		out = append(out, item)
+	}
+	return &QueryVectorsResponse{
+		DistanceMetric: strings.ToLower(indexMeta.Metric),
+		Vectors:        out,
+	}, nil
+}
+```
+
+- [ ] **步骤 3: 增加查询测试**
+
+```go
+// pkg/gateway/vectorbucket/query_service_test.go
+package vectorbucket
+
+import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/controller"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
 )
 
-// mockLoadReleaser 用于控制器测试
 type mockLoadReleaser struct{}
 
-func (m *mockLoadReleaser) LoadCollection(ctx context.Context, name string) error    { return nil }
-func (m *mockLoadReleaser) ReleaseCollection(ctx context.Context, name string) error { return nil }
+func (mockLoadReleaser) LoadCollection(ctx context.Context, name string) error    { return nil }
+func (mockLoadReleaser) ReleaseCollection(ctx context.Context, name string) error { return nil }
 
-func testServerWithController(t *testing.T) *Server {
-	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store := metadata.NewSQLiteStore(dbPath)
+func TestQueryServiceLifecycle(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "vectorbucket.db")
+	store := metadata.NewSQLiteStore(db)
 	require.NoError(t, store.Init(context.Background()))
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 
 	cfg := config.DefaultConfig()
-	ctrl := controller.NewLoadController(&mockLoadReleaser{}, cfg.LoadBudgetMB, 30*time.Minute, cfg.MaxLoadedColls)
-	return NewServer(&cfg, store, nil, ctrl)
-}
+	bucketSvc := NewBucketService(store, quota.NewChecker(store, &cfg))
+	_, err := bucketSvc.CreateVectorBucket(context.Background(), &CreateVectorBucketRequest{
+		RequestContext:   RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		VectorBucketName: "demo-bucket",
+	})
+	require.NoError(t, err)
 
-func TestQueryVectors(t *testing.T) {
-	s := testServerWithController(t)
-	createTestBucket(t, s, "bkt")
+	objSvc := NewObjectService(store, router.NewNamespaceRouter(store), nil, nil, quota.NewChecker(store, &cfg), cfg)
+	_, err = objSvc.CreateIndex(context.Background(), &CreateIndexRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         Target{VectorBucketName: "demo-bucket"},
+		IndexName:      "demo-index",
+		DataType:       "float32",
+		Dimension:      4,
+		DistanceMetric: "cosine",
+	})
+	require.NoError(t, err)
 
-	// 创建 dim=3 的 collection
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "coll", Dim: 3, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	// 查询
-	body, _ = json.Marshal(QueryRequest{Vector: []float32{0.1, 0.2, 0.3}, TopK: 5})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/query", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-func TestQueryVectorsTopKTooLarge(t *testing.T) {
-	s := testServerWithController(t)
-	createTestBucket(t, s, "bkt")
-
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "coll", Dim: 3, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	body, _ = json.Marshal(QueryRequest{Vector: []float32{0.1, 0.2, 0.3}, TopK: 100})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/query", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestQueryVectorsDimMismatch(t *testing.T) {
-	s := testServerWithController(t)
-	createTestBucket(t, s, "bkt")
-
-	body, _ := json.Marshal(CreateCollectionRequest{Name: "coll", Dim: 3, Metric: "COSINE"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets/bkt/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	body, _ = json.Marshal(QueryRequest{Vector: []float32{0.1, 0.2}, TopK: 5}) // dim=2 != 3
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/bkt/collections/coll/query", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	s.Engine().ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	ctrl := controller.NewLoadController(mockLoadReleaser{}, cfg.LoadBudgetMB, 30*time.Minute, cfg.MaxLoadedColls)
+	querySvc := NewQueryService(store, router.NewNamespaceRouter(store), nil, ctrl)
+	resp, err := querySvc.QueryVectors(context.Background(), &QueryVectorsRequest{
+		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+		QueryVector:    VectorData{Float32: []float32{0.1, 0.2, 0.3, 0.4}},
+		TopK:           5,
+		Filter:         json.RawMessage(`{"field":"tenant","op":"eq","value":"t1"}`),
+		ReturnDistance: true,
+		ReturnMetadata: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "cosine", resp.DistanceMetric)
 }
 ```
 
-- [ ] **步骤 3: 运行测试**
+- [ ] **步骤 4: 在 shim 注册 `/QueryVectors` 并写协议测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/gateway/...`
+```go
+// $JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers.go
+func registerS3VectorsHandlers(router *mux.Router, api objectAPIHandlers) {
+	router.Methods(http.MethodPost).Path("/QueryVectors").HandlerFunc(api.QueryVectorsHandler)
+}
+
+func (api objectAPIHandlers) QueryVectorsHandler(w http.ResponseWriter, r *http.Request) {
+	var req vectorbucket.QueryVectorsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(vectorbucket.ErrValidation))
+		return
+	}
+	req.RequestID = mustGetRequestID(r)
+	req.Region = globalSite.Region()
+	req.AccountID = mustResolveAccountID(r)
+
+	ext, err := api.vectorExtension()
+	if err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(err))
+		return
+	}
+	resp, err := ext.QueryVectors(r.Context(), &req)
+	if err != nil {
+		writeVectorAPIError(w, vectorbucket.TranslateError(err))
+		return
+	}
+	writeVectorJSON(w, http.StatusOK, resp)
+}
+```
+
+- [ ] **步骤 5: 运行测试**
+
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/... ./pkg/gateway/...`
 预期: PASS
 
-- [ ] **步骤 4: 提交**
+- [ ] **步骤 6: 提交**
 
 ```bash
-git add internal/vectorbucket/gateway/handlers_query.go internal/vectorbucket/gateway/handlers_query_test.go
-git commit -s -m "feat(vectorbucket): add query handler with Load/Release Controller integration
+git add pkg/gateway/vectorbucket/query_service.go pkg/gateway/vectorbucket/query_service_test.go pkg/gateway/vectorbucket/filter/translator.go pkg/gateway/vectorbucket/filter/translator_test.go
+git commit -s -m "feat(vectorbucket): add query service and filter translation for protocol shim
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-## 任务 14：Main 入口（串联所有组件）
+## 任务 14：`cmd/gateway.go` + `NewJFSGateway` + 协议 Shim 入口接线
 
 **文件:**
-- 修改: `internal/vectorbucket/cmd/main.go`
+- 修改: `cmd/gateway.go`
+- 新建或修改: `pkg/gateway/vectorbucket/bootstrap.go`
 
-- [ ] **步骤 1: 更新 main.go 串联所有组件**
+> 说明: 真正的接线点必须放在 `cmd/gateway.go`、`pkg/gateway/gateway.go` 的 `NewJFSGateway` 路径，以及需要时的 `juicedata/minio` 协议 shim 上，不再新增独立 `main.go` 入口。Phase 1 最终应表现为 gateway 启动后自动具备 S3 Vectors 独立操作能力。
+
+> **联调方式约束:** 接线验证时，默认 JuiceFS 通过本地 `replace github.com/minio/minio => $JUICEDATA_MINIO_ROOT` 消费 shim 变更，而不是依赖远端 minio 提交。
+
+- [ ] **步骤 1: 在 `bootstrap.go` 提供从 gateway 入口可直接调用的装配函数**
 
 ```go
-// internal/vectorbucket/cmd/main.go
-package main
+// pkg/gateway/vectorbucket/bootstrap.go
+package vectorbucket
 
 import (
 	"context"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus/internal/vectorbucket/adapter"
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/controller"
-	"github.com/milvus-io/milvus/internal/vectorbucket/gateway"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
-	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/adapter"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
-func main() {
-	cfg := config.LoadConfig()
+type BootstrapResult struct {
+	Runtime    *Runtime
+	Stop       func(context.Context) error
+}
 
-	// 初始化 metadata 存储
+func Bootstrap(ctx context.Context, cfg config.Config) (*BootstrapResult, error) {
 	store := metadata.NewSQLiteStore(cfg.SQLitePath)
-	if err := store.Init(context.Background()); err != nil {
-		log.Fatal("failed to init metadata store", zap.Error(err))
+	if err := store.Init(ctx); err != nil {
+		return nil, err
 	}
-	defer store.Close()
 
-	// 初始化 Milvus 适配层
 	milvusAdapter, err := adapter.NewMilvusAdapter(cfg.MilvusAddr)
 	if err != nil {
-		log.Fatal("failed to connect to Milvus", zap.Error(err))
+		_ = store.Close()
+		return nil, err
 	}
-	defer milvusAdapter.Close()
 
-	// 初始化 Load/Release 控制器
-	ttl := time.Duration(cfg.TTLSeconds) * time.Second
-	ctrl := controller.NewLoadController(milvusAdapter, cfg.LoadBudgetMB, ttl, cfg.MaxLoadedColls)
-
-	// 启动 TTL 扫描循环
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctrl := controller.NewLoadController(milvusAdapter, cfg.LoadBudgetMB, time.Duration(cfg.TTLSeconds)*time.Second, cfg.MaxLoadedColls)
 	ctrl.StartTTLSweepLoop(ctx, 60*time.Second)
 
-	// 初始化 Gateway 服务
-	srv := gateway.NewServer(&cfg, store, milvusAdapter, ctrl)
+	runtime := NewRuntime(cfg, store, milvusAdapter, ctrl)
+	return &BootstrapResult{
+		Runtime: runtime,
+		Stop: func(stopCtx context.Context) error {
+			_ = milvusAdapter.Close()
+			return runtime.Close(stopCtx)
+		},
+	}, nil
+}
+```
 
-	// 优雅关闭
+- [ ] **步骤 2: 在 `cmd/gateway.go` 使用真实 gateway 启动链接线**
+
+```go
+// cmd/gateway.go
+func gateway(c *cli.Context) error {
+	setup(c, 2)
+	metaAddr := c.Args().Get(0)
+	listenAddr := c.Args().Get(1)
+	conf, jfs := initForSvc(c, "s3gateway", metaAddr, listenAddr)
+
+	vbCfg := vectorbucketconfig.LoadConfig()
+	vbBoot, err := vectorbucket.Bootstrap(context.Background(), vbCfg)
+	if err != nil {
+		return err
+	}
+
+	jfsGateway, err = jfsgateway.NewJFSGateway(
+		jfs,
+		conf,
+		&jfsgateway.Config{
+			MultiBucket:  c.Bool("multi-buckets"),
+			KeepEtag:     c.Bool("keep-etag"),
+			Umask:        uint16(umask),
+			ObjTag:       c.Bool("object-tag"),
+			ObjMeta:      c.Bool("object-meta"),
+			HeadDir:      c.Bool("head-dir"),
+			HideDir:      c.Bool("hide-dir-object"),
+			ReadOnly:     readonly,
+			VectorBucket: vbBoot.Runtime,
+		},
+	)
+	if err != nil {
+		_ = vbBoot.Stop(context.Background())
+		return err
+	}
+
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		log.Info("shutting down Vector Bucket Gateway...")
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
-		srv.Stop(shutdownCtx)
-		cancel()
+		_ = vbBoot.Stop(context.Background())
 	}()
 
-	log.Info("Vector Bucket Gateway starting", zap.String("addr", cfg.ListenAddr))
-	if err := srv.Start(); err != nil && err.Error() != "http: Server closed" {
-		log.Fatal("server error", zap.Error(err))
-	}
+	app := &mcli.App{Action: gateway2, Flags: gatewayFlags}
+	return app.Run([]string{"server", "--address", listenAddr, "--anonymous"})
 }
 ```
 
-- [ ] **步骤 2: 验证编译通过**
+- [ ] **步骤 3: 验证编译通过**
 
-运行: `cd /root/xty/milvus && go build ./internal/vectorbucket/cmd/`
+运行: `cd $JUICEFS_ROOT && go build ./cmd/... ./pkg/gateway/vectorbucket/... ./pkg/gateway/...`
 预期: 成功
 
-- [ ] **步骤 3: 提交**
+- [ ] **步骤 4: 提交**
 
 ```bash
-git add internal/vectorbucket/cmd/main.go
-git commit -s -m "feat(vectorbucket): wire all components in main entry point with graceful shutdown
+git add cmd/gateway.go pkg/gateway/vectorbucket/bootstrap.go
+git commit -s -m "feat(vectorbucket): wire vector bucket bootstrap into gateway entry
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-## 任务 15：全量测试 + 修复问题
+## 任务 15：全量测试 + 协议兼容性修复
 
 - [ ] **步骤 1: 运行所有 vectorbucket 测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/... ./pkg/gateway/... ./cmd/...`
 预期: 全部 PASS
 
 - [ ] **步骤 2: 运行 go vet**
 
-运行: `cd /root/xty/milvus && go vet ./internal/vectorbucket/...`
+运行: `cd $JUICEFS_ROOT && go vet ./pkg/gateway/vectorbucket/... ./pkg/gateway/... ./cmd/...`
 预期: 无问题
 
-- [ ] **步骤 3: 修复步骤 1-2 发现的编译或测试错误**
+- [ ] **步骤 3: 如果改动了 `juicedata/minio` shim，再运行 fork 侧测试**
 
-常见问题：
-- 缺少 import（补充 `"fmt"`、`"encoding/json"`、`"context"` 等）
-- import 循环（adapter 接口如有需要应独立文件）
-- controller 构造函数中 `time.Duration` 和 `int` 类型不匹配
+运行: `cd $JUICEDATA_MINIO_ROOT && go test -count=1 -v ./cmd/...`
+预期: PASS
 
-- [ ] **步骤 4: 如有修复则提交**
+- [ ] **步骤 3.5: 恢复或确认 JuiceFS `go.mod` 仍指向本地 minio 目录**
+
+运行: `cd $JUICEFS_ROOT && rg -n "replace github.com/minio/minio" go.mod`
+预期: `replace` 指向本地 `$JUICEDATA_MINIO_ROOT`，而不是远端版本号
+
+- [ ] **步骤 4: 修复步骤 1-3 发现的编译或测试错误**
+
+常见问题:
+- `pkg/gateway` 与 `pkg/gateway/vectorbucket` 相互引用导致 import cycle
+- `vectorBucketName/indexName` 和 `vectorBucketArn/indexArn` 的二选一解析遗漏
+- `queryVector.float32` 或 `vectors[].data.float32` 的 union 解析不完整
+- `ServiceQuotaExceededException`、`TooManyRequestsException`、`ServiceUnavailableException` 映射到错误的 HTTP 状态码
+- filter 翻译器生成的 Milvus 表达式与 metadata schema 不匹配
+
+- [ ] **步骤 5: 如有修复则提交**
 
 ```bash
-git add internal/vectorbucket/
+git add pkg/gateway/vectorbucket/ pkg/gateway/
 git commit -s -m "fix(vectorbucket): fix compilation and test issues from full test suite run
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -3249,129 +3417,172 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-## 任务 16：验证完整 API 契约
+## 任务 16：验证完整 Gateway / Protocol 契约
 
-- [ ] **步骤 1: 编写端到端 API 契约测试**
+- [ ] **步骤 1: 编写端到端 Gateway / Protocol 契约测试（基于 JuiceFS gateway 集成）**
+
+> **实际落点修正:** 这里要把两条链都测到。第一条是 `Runtime` 直连链，验证 JuiceFS 侧业务编排没有歧义；第二条是 shim HTTP 链，验证 `POST /CreateVectorBucket`、`/CreateIndex`、`/PutVectors`、`/QueryVectors`、`/DeleteVectors`、`/DeleteIndex`、`/DeleteVectorBucket` 的请求体和返回体都能走通。
 
 ```go
-// internal/vectorbucket/integration/api_test.go
+// pkg/gateway/vectorbucket/integration/gateway_contract_test.go
 package integration
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/internal/vectorbucket/config"
-	"github.com/milvus-io/milvus/internal/vectorbucket/controller"
-	"github.com/milvus-io/milvus/internal/vectorbucket/gateway"
-	"github.com/milvus-io/milvus/internal/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
 type mockLR struct{}
-func (m *mockLR) LoadCollection(ctx context.Context, name string) error    { return nil }
-func (m *mockLR) ReleaseCollection(ctx context.Context, name string) error { return nil }
 
-func TestFullAPIFlow(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store := metadata.NewSQLiteStore(dbPath)
+func (mockLR) LoadCollection(ctx context.Context, name string) error    { return nil }
+func (mockLR) ReleaseCollection(ctx context.Context, name string) error { return nil }
+
+func TestRuntimeContract(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "vectorbucket.db")
+	store := metadata.NewSQLiteStore(db)
 	require.NoError(t, store.Init(context.Background()))
-	defer store.Close()
+	t.Cleanup(func() { _ = store.Close() })
 
 	cfg := config.DefaultConfig()
-	ctrl := controller.NewLoadController(&mockLR{}, cfg.LoadBudgetMB, 30*time.Minute, cfg.MaxLoadedColls)
-	srv := gateway.NewServer(&cfg, store, nil, ctrl)
-	engine := srv.Engine()
+	ctrl := controller.NewLoadController(mockLR{}, cfg.LoadBudgetMB, 30*time.Minute, cfg.MaxLoadedColls)
+	runtime := vectorbucket.NewRuntime(cfg, store, nil, ctrl)
 
-	// 1. 创建 bucket
-	body, _ := json.Marshal(map[string]string{"name": "test-bucket"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/buckets", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusCreated, w.Code)
+	_, err := runtime.CreateVectorBucket(context.Background(), &vectorbucket.CreateVectorBucketRequest{
+		RequestContext:   vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		VectorBucketName: "demo-bucket",
+	})
+	require.NoError(t, err)
 
-	// 2. 查询 bucket
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/v1/buckets/test-bucket", nil)
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
+	_, err = runtime.CreateIndex(context.Background(), &vectorbucket.CreateIndexRequest{
+		RequestContext: vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         vectorbucket.Target{VectorBucketName: "demo-bucket"},
+		IndexName:      "demo-index",
+		DataType:       "float32",
+		Dimension:      4,
+		DistanceMetric: "cosine",
+	})
+	require.NoError(t, err)
 
-	// 3. 创建 collection
-	body, _ = json.Marshal(map[string]any{"name": "vectors", "dim": 4, "metric": "COSINE"})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/test-bucket/collections", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusCreated, w.Code)
-
-	// 4. 写入向量
-	body, _ = json.Marshal(map[string]any{
-		"vectors": []map[string]any{
-			{"id": "v1", "vector": []float32{0.1, 0.2, 0.3, 0.4}, "metadata": map[string]string{"tag": "a"}},
-			{"id": "v2", "vector": []float32{0.5, 0.6, 0.7, 0.8}},
+	err = runtime.PutVectors(context.Background(), &vectorbucket.PutVectorsRequest{
+		RequestContext: vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         vectorbucket.Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+		Vectors: []vectorbucket.PutInputVector{
+			{Key: "v1", Data: vectorbucket.VectorData{Float32: []float32{0.1, 0.2, 0.3, 0.4}}, Metadata: json.RawMessage(`{"tenant":"t1"}`)},
+			{Key: "v2", Data: vectorbucket.VectorData{Float32: []float32{0.4, 0.3, 0.2, 0.1}}},
 		},
 	})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/test-bucket/collections/vectors/vectors", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
+	require.NoError(t, err)
 
-	// 5. 查询向量
-	body, _ = json.Marshal(map[string]any{"vector": []float32{0.1, 0.2, 0.3, 0.4}, "topK": 5})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/test-bucket/collections/vectors/query", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
+	queryResp, err := runtime.QueryVectors(context.Background(), &vectorbucket.QueryVectorsRequest{
+		RequestContext: vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         vectorbucket.Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+		QueryVector:    vectorbucket.VectorData{Float32: []float32{0.1, 0.2, 0.3, 0.4}},
+		TopK:           5,
+		ReturnDistance: true,
+		ReturnMetadata: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "cosine", queryResp.DistanceMetric)
 
-	// 6. 删除向量
-	body, _ = json.Marshal(map[string]any{"ids": []string{"v1"}})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/v1/buckets/test-bucket/collections/vectors/vectors:delete", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
+	require.NoError(t, runtime.DeleteVectors(context.Background(), &vectorbucket.DeleteVectorsRequest{
+		RequestContext: vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         vectorbucket.Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+		Keys:           []string{"v1"},
+	}))
+	require.NoError(t, runtime.DeleteIndex(context.Background(), &vectorbucket.DeleteIndexRequest{
+		RequestContext: vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         vectorbucket.Target{VectorBucketName: "demo-bucket", IndexName: "demo-index"},
+	}))
+	require.NoError(t, runtime.DeleteVectorBucket(context.Background(), &vectorbucket.DeleteVectorBucketRequest{
+		RequestContext: vectorbucket.RequestContext{AccountID: "123456789012", Region: "us-east-1"},
+		Target:         vectorbucket.Target{VectorBucketName: "demo-bucket"},
+	}))
+}
+```
 
-	// 7. 删除 collection
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/v1/buckets/test-bucket/collections/vectors", nil)
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNoContent, w.Code)
+```go
+// $JUICEDATA_MINIO_ROOT/cmd/s3vectors_handlers_test.go
+func TestCreateVectorBucketHandler(t *testing.T) {
+	body := bytes.NewBufferString(`{"vectorBucketName":"demo-bucket"}`)
+	req := httptest.NewRequest(http.MethodPost, "/CreateVectorBucket", body)
+	rec := httptest.NewRecorder()
 
-	// 8. 删除 bucket（已空）
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/v1/buckets/test-bucket", nil)
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNoContent, w.Code)
+	router := mux.NewRouter()
+	registerS3VectorsHandlers(router, newTestObjectAPIHandlers(t))
+	router.ServeHTTP(rec, req)
 
-	// 9. 验证 bucket 已不存在
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/v1/buckets/test-bucket", nil)
-	engine.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.JSONEq(t, `{"vectorBucketArn":"arn:aws:s3vectors:us-east-1:123456789012:bucket/demo-bucket"}`, rec.Body.String())
+}
+
+func TestPutVectorsHandler(t *testing.T) {
+	body := bytes.NewBufferString(`{
+	  "vectorBucketName":"demo-bucket",
+	  "indexName":"demo-index",
+	  "vectors":[
+	    {"key":"v1","data":{"float32":[0.1,0.2,0.3,0.4]},"metadata":{"tenant":"t1"}}
+	  ]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/PutVectors", body)
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	registerS3VectorsHandlers(router, newTestObjectAPIHandlers(t))
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestQueryVectorsHandler(t *testing.T) {
+	body := bytes.NewBufferString(`{
+	  "vectorBucketName":"demo-bucket",
+	  "indexName":"demo-index",
+	  "topK":5,
+	  "queryVector":{"float32":[0.1,0.2,0.3,0.4]},
+	  "returnDistance":true,
+	  "returnMetadata":true
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/QueryVectors", body)
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	registerS3VectorsHandlers(router, newTestObjectAPIHandlers(t))
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
 }
 ```
 
 - [ ] **步骤 2: 运行集成测试**
 
-运行: `cd /root/xty/milvus && go test -tags dynamic,test -gcflags="all=-N -l" -count=1 -v ./internal/vectorbucket/integration/...`
+运行: `cd $JUICEFS_ROOT && go test -count=1 -v ./pkg/gateway/vectorbucket/integration/... ./pkg/gateway/...`
 预期: PASS
 
-- [ ] **步骤 3: 提交**
+- [ ] **步骤 3: 如果改动了 `juicedata/minio` shim，再运行 handler 契约测试**
+
+运行: `cd $JUICEDATA_MINIO_ROOT && go test -count=1 -v ./cmd/...`
+预期: PASS
+
+- [ ] **步骤 3.5: 确认当前仓库没有把 minio 目录纳入版本管理**
+
+运行: `cd $JUICEFS_ROOT && git status --short`
+预期: 只出现 JuiceFS 侧改动；不会出现 `$JUICEDATA_MINIO_ROOT` 下的文件
+
+- [ ] **步骤 4: 提交**
 
 ```bash
-git add internal/vectorbucket/integration/
-git commit -s -m "test(vectorbucket): add full API flow integration test covering all Phase 1 endpoints
+git add pkg/gateway/vectorbucket/integration/ pkg/gateway/gateway_test.go
+git commit -s -m "test(vectorbucket): add runtime and protocol contract coverage for phase 1
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
@@ -3382,7 +3593,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 | 任务 | 组件 | 核心交付物 |
 |------|------|-----------|
-| 1 | 配置 + 脚手架 | `config.go`、`main.go` 占位 |
+| 1 | JuiceFS 网关挂载 + 配置 | `cmd/gateway.go` 接线、`bootstrap.go`、`config.go` |
 | 2 | Metadata 模型 | `models.go`、`store.go` 接口 |
 | 3 | SQLite Store | Bucket + Collection 完整 CRUD |
 | 4 | Namespace Router | 逻辑名 -> 物理名解析 |
@@ -3390,11 +3601,11 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 | 6 | Load/Release 控制器 | LRU + TTL + 预算 + in-flight 追踪 |
 | 7 | 配额管控 | Bucket/Collection/维度/向量数限制 |
 | 8 | Prometheus 指标 | Phase 1 全部指标定义 |
-| 9 | 错误响应 | 统一 HTTP 错误响应格式 |
-| 10 | Bucket Handler | 创建/查询/删除 Bucket HTTP API |
-| 11 | Collection Handler | 创建/删除 Collection HTTP API |
-| 12 | Vector Handler | Put/Upsert/Delete 向量 HTTP API |
-| 13 | Query Handler | 查询 + Load/Release 控制器集成 |
-| 14 | Main 入口 | 串联所有组件 + 优雅关闭 |
-| 15 | 全量测试 | 修复剩余编译和测试问题 |
-| 16 | API 契约测试 | 端到端完整流程验证 |
+| 9 | 协议契约 | JuiceFS 扩展接口 + S3 / Vector Bucket 错误映射 |
+| 10 | Runtime 挂接 | `jfsObjects` 挂载 Vector Bucket runtime，并向协议层暴露扩展接口 |
+| 11 | Vector Bucket 协议 | `CreateVectorBucket/GetVectorBucket/DeleteVectorBucket/ListVectorBuckets` |
+| 12 | Index 与写入协议 | `CreateIndex/DeleteIndex/PutVectors/DeleteVectors` |
+| 13 | 查询协议 | `QueryVectors` + Load/Release + 必要的 juicedata/minio 协议 shim |
+| 14 | Gateway 入口接线 | `cmd/gateway.go` + `NewJFSGateway` + 协议 shim 串联所有组件 |
+| 15 | 全量验证 | 编译、测试、协议兼容性修复 |
+| 16 | Gateway / Protocol 契约测试 | 端到端完整流程验证 |
