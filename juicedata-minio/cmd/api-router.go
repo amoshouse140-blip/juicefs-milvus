@@ -185,6 +185,15 @@ func registerAPIRouter(router *mux.Router) {
 
 	// API Router
 	apiRouter := router.PathPrefix(SlashSeparator).Subrouter()
+	apiRouter.Methods(http.MethodPost).Path("/CreateVectorBucket").HandlerFunc(collectAPIStats("createvectorbucket", httpTraceAll(api.CreateVectorBucketHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/GetVectorBucket").HandlerFunc(collectAPIStats("getvectorbucket", httpTraceAll(api.GetVectorBucketHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/ListVectorBuckets").HandlerFunc(collectAPIStats("listvectorbuckets", httpTraceAll(api.ListVectorBucketsHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/DeleteVectorBucket").HandlerFunc(collectAPIStats("deletevectorbucket", httpTraceAll(api.DeleteVectorBucketHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/CreateIndex").HandlerFunc(collectAPIStats("createindex", httpTraceAll(api.CreateIndexHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/DeleteIndex").HandlerFunc(collectAPIStats("deleteindex", httpTraceAll(api.DeleteIndexHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/PutVectors").HandlerFunc(collectAPIStats("putvectors", httpTraceAll(api.PutVectorsHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/DeleteVectors").HandlerFunc(collectAPIStats("deletevectors", httpTraceAll(api.DeleteVectorsHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/QueryVectors").HandlerFunc(collectAPIStats("queryvectors", httpTraceAll(api.QueryVectorsHandler)))
 
 	var routers []*mux.Router
 	for _, domainName := range globalDomainNames {

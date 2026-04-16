@@ -43,6 +43,7 @@ import (
 	xhttp "github.com/minio/minio/cmd/http"
 
 	"github.com/juicedata/juicefs/pkg/fs"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
@@ -58,29 +59,251 @@ var mctx meta.Context
 var logger = utils.GetLogger("juicefs")
 
 type Config struct {
-	MultiBucket bool
-	KeepEtag    bool
-	Umask       uint16
-	ObjTag      bool
-	ObjMeta     bool
-	HeadDir     bool
-	HideDir     bool
-	ReadOnly    bool
+	MultiBucket  bool
+	KeepEtag     bool
+	Umask        uint16
+	ObjTag       bool
+	ObjMeta      bool
+	HeadDir      bool
+	HideDir      bool
+	ReadOnly     bool
+	VectorBucket vectorbucket.Extension
 }
 
 func NewJFSGateway(jfs *fs.FileSystem, conf *vfs.Config, gConf *Config) (minio.ObjectLayer, error) {
 	mctx = meta.NewContext(uint32(os.Getpid()), uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
-	jfsObj := &jfsObjects{fs: jfs, conf: conf, listPool: minio.NewTreeWalkPool(time.Minute * 30), gConf: gConf, nsMutex: minio.NewNSLock(false)}
+	jfsObj := &jfsObjects{fs: jfs, conf: conf, listPool: minio.NewTreeWalkPool(time.Minute * 30), gConf: gConf, nsMutex: minio.NewNSLock(false), vectorbucket: gConf.VectorBucket}
 	go jfsObj.cleanup()
 	return jfsObj, nil
 }
 
 type jfsObjects struct {
-	conf     *vfs.Config
-	fs       *fs.FileSystem
-	listPool *minio.TreeWalkPool
-	nsMutex  *minio.NsLockMap
-	gConf    *Config
+	conf         *vfs.Config
+	fs           *fs.FileSystem
+	listPool     *minio.TreeWalkPool
+	nsMutex      *minio.NsLockMap
+	gConf        *Config
+	vectorbucket vectorbucket.Extension
+}
+
+type vectorBucketProvider interface {
+	VectorBucketExtension() vectorbucket.Extension
+}
+
+func (n *jfsObjects) VectorBucketExtension() vectorbucket.Extension {
+	return n.vectorbucket
+}
+
+func (n *jfsObjects) CreateVectorBucket(ctx context.Context, req *minio.CreateVectorBucketRequest) (*minio.CreateVectorBucketResponse, error) {
+	if n.vectorbucket == nil {
+		return nil, minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	resp, err := n.vectorbucket.CreateVectorBucket(ctx, &vectorbucket.CreateVectorBucketRequest{
+		RequestContext:          toVectorRequestContext(req.RequestContext),
+		VectorBucketName:        req.VectorBucketName,
+		EncryptionConfiguration: toVectorEncryptionConfiguration(req.EncryptionConfiguration),
+		Tags:                    req.Tags,
+	})
+	if err != nil {
+		return nil, translateVectorError(err)
+	}
+	return &minio.CreateVectorBucketResponse{VectorBucketARN: resp.VectorBucketARN}, nil
+}
+
+func (n *jfsObjects) GetVectorBucket(ctx context.Context, req *minio.GetVectorBucketRequest) (*minio.GetVectorBucketResponse, error) {
+	if n.vectorbucket == nil {
+		return nil, minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	resp, err := n.vectorbucket.GetVectorBucket(ctx, &vectorbucket.GetVectorBucketRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+	})
+	if err != nil {
+		return nil, translateVectorError(err)
+	}
+	return &minio.GetVectorBucketResponse{
+		VectorBucketARN:         resp.VectorBucketARN,
+		VectorBucketName:        resp.VectorBucketName,
+		CreationTime:            resp.CreationTime,
+		EncryptionConfiguration: toMinioEncryptionConfiguration(resp.EncryptionConfiguration),
+	}, nil
+}
+
+func (n *jfsObjects) ListVectorBuckets(ctx context.Context, req *minio.ListVectorBucketsRequest) (*minio.ListVectorBucketsResponse, error) {
+	if n.vectorbucket == nil {
+		return nil, minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	resp, err := n.vectorbucket.ListVectorBuckets(ctx, &vectorbucket.ListVectorBucketsRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		MaxResults:     req.MaxResults,
+		NextToken:      req.NextToken,
+	})
+	if err != nil {
+		return nil, translateVectorError(err)
+	}
+	out := &minio.ListVectorBucketsResponse{NextToken: resp.NextToken}
+	out.VectorBuckets = make([]minio.VectorBucketSummary, 0, len(resp.VectorBuckets))
+	for _, bucket := range resp.VectorBuckets {
+		out.VectorBuckets = append(out.VectorBuckets, minio.VectorBucketSummary{
+			VectorBucketARN:  bucket.VectorBucketARN,
+			VectorBucketName: bucket.VectorBucketName,
+			CreationTime:     bucket.CreationTime,
+		})
+	}
+	return out, nil
+}
+
+func (n *jfsObjects) DeleteVectorBucket(ctx context.Context, req *minio.DeleteVectorBucketRequest) error {
+	if n.vectorbucket == nil {
+		return minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	return translateVectorError(n.vectorbucket.DeleteVectorBucket(ctx, &vectorbucket.DeleteVectorBucketRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+	}))
+}
+
+func (n *jfsObjects) CreateIndex(ctx context.Context, req *minio.CreateIndexRequest) (*minio.CreateIndexResponse, error) {
+	if n.vectorbucket == nil {
+		return nil, minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	resp, err := n.vectorbucket.CreateIndex(ctx, &vectorbucket.CreateIndexRequest{
+		RequestContext:          toVectorRequestContext(req.RequestContext),
+		Target:                  toVectorTarget(req.Target),
+		IndexName:               req.IndexName,
+		DataType:                req.DataType,
+		Dimension:               req.Dimension,
+		DistanceMetric:          req.DistanceMetric,
+		EncryptionConfiguration: toVectorEncryptionConfiguration(req.EncryptionConfiguration),
+		MetadataConfiguration:   toVectorMetadataConfiguration(req.MetadataConfiguration),
+		Tags:                    req.Tags,
+	})
+	if err != nil {
+		return nil, translateVectorError(err)
+	}
+	return &minio.CreateIndexResponse{IndexARN: resp.IndexARN}, nil
+}
+
+func (n *jfsObjects) DeleteIndex(ctx context.Context, req *minio.DeleteIndexRequest) error {
+	if n.vectorbucket == nil {
+		return minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	return translateVectorError(n.vectorbucket.DeleteIndex(ctx, &vectorbucket.DeleteIndexRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+	}))
+}
+
+func (n *jfsObjects) PutVectors(ctx context.Context, req *minio.PutVectorsRequest) error {
+	if n.vectorbucket == nil {
+		return minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	vectors := make([]vectorbucket.PutInputVector, 0, len(req.Vectors))
+	for _, vector := range req.Vectors {
+		vectors = append(vectors, vectorbucket.PutInputVector{
+			Key:      vector.Key,
+			Data:     vectorbucket.VectorData{Float32: append([]float32(nil), vector.Data.Float32...)},
+			Metadata: append([]byte(nil), vector.Metadata...),
+		})
+	}
+	return translateVectorError(n.vectorbucket.PutVectors(ctx, &vectorbucket.PutVectorsRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+		Vectors:        vectors,
+	}))
+}
+
+func (n *jfsObjects) DeleteVectors(ctx context.Context, req *minio.DeleteVectorsRequest) error {
+	if n.vectorbucket == nil {
+		return minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	return translateVectorError(n.vectorbucket.DeleteVectors(ctx, &vectorbucket.DeleteVectorsRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+		Keys:           append([]string(nil), req.Keys...),
+	}))
+}
+
+func (n *jfsObjects) QueryVectors(ctx context.Context, req *minio.QueryVectorsRequest) (*minio.QueryVectorsResponse, error) {
+	if n.vectorbucket == nil {
+		return nil, minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	resp, err := n.vectorbucket.QueryVectors(ctx, &vectorbucket.QueryVectorsRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+		QueryVector:    vectorbucket.VectorData{Float32: append([]float32(nil), req.QueryVector.Float32...)},
+		TopK:           req.TopK,
+		Filter:         append([]byte(nil), req.Filter...),
+		ReturnDistance: req.ReturnDistance,
+		ReturnMetadata: req.ReturnMetadata,
+	})
+	if err != nil {
+		return nil, translateVectorError(err)
+	}
+	out := &minio.QueryVectorsResponse{DistanceMetric: resp.DistanceMetric}
+	out.Vectors = make([]minio.QueryResultVector, 0, len(resp.Vectors))
+	for _, vector := range resp.Vectors {
+		out.Vectors = append(out.Vectors, minio.QueryResultVector{
+			Key:      vector.Key,
+			Distance: vector.Distance,
+			Metadata: append([]byte(nil), vector.Metadata...),
+		})
+	}
+	return out, nil
+}
+
+func toVectorRequestContext(ctx minio.RequestContext) vectorbucket.RequestContext {
+	return vectorbucket.RequestContext{
+		AccountID: ctx.AccountID,
+		Region:    ctx.Region,
+		RequestID: ctx.RequestID,
+		Headers:   ctx.Headers,
+	}
+}
+
+func toVectorTarget(target minio.Target) vectorbucket.Target {
+	return vectorbucket.Target{
+		VectorBucketName: target.VectorBucketName,
+		VectorBucketARN:  target.VectorBucketARN,
+		IndexName:        target.IndexName,
+		IndexARN:         target.IndexARN,
+	}
+}
+
+func toVectorEncryptionConfiguration(cfg *minio.EncryptionConfiguration) *vectorbucket.EncryptionConfiguration {
+	if cfg == nil {
+		return nil
+	}
+	return &vectorbucket.EncryptionConfiguration{SSEType: cfg.SSEType, KMSKeyARN: cfg.KMSKeyARN}
+}
+
+func toMinioEncryptionConfiguration(cfg *vectorbucket.EncryptionConfiguration) *minio.EncryptionConfiguration {
+	if cfg == nil {
+		return nil
+	}
+	return &minio.EncryptionConfiguration{SSEType: cfg.SSEType, KMSKeyARN: cfg.KMSKeyARN}
+}
+
+func toVectorMetadataConfiguration(cfg *minio.MetadataConfiguration) *vectorbucket.MetadataConfiguration {
+	if cfg == nil {
+		return nil
+	}
+	return &vectorbucket.MetadataConfiguration{
+		NonFilterableMetadataKeys: append([]string(nil), cfg.NonFilterableMetadataKeys...),
+	}
+}
+
+func translateVectorError(err error) error {
+	if err == nil {
+		return nil
+	}
+	apiErr := vectorbucket.TranslateError(err)
+	return minio.VectorAPIError{
+		Code:       apiErr.Code,
+		Message:    apiErr.Message,
+		Status:     apiErr.Status,
+		RetryAfter: apiErr.RetryAfter,
+	}
 }
 
 func (n *jfsObjects) PutObjectMetadata(ctx context.Context, s string, s2 string, options minio.ObjectOptions) (minio.ObjectInfo, error) {

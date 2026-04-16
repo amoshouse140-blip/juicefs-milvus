@@ -129,7 +129,7 @@ func testTreeWalkPrefix(t *testing.T, listDir ListDirFunc, isLeaf IsLeafFunc, is
 	// Check if all entries received on the channel match the prefix.
 	for res := range twResultCh {
 		if !HasPrefix(res.entry.Name, prefix) {
-			t.Errorf("Entry %s doesn't match prefix %s", res.entry, prefix)
+			t.Errorf("Entry %s doesn't match prefix %s", res.entry.Name, prefix)
 		}
 	}
 }
@@ -378,7 +378,7 @@ func TestRecursiveTreeWalk(t *testing.T) {
 				testCase.prefix, testCase.marker, testCase.recursive,
 				listDir, isLeaf, isLeafDir, endWalkCh) {
 				if _, found := testCase.expected[entry.entry.Name]; !found {
-					t.Errorf("Expected %s, but couldn't find", entry.entry)
+					t.Errorf("Expected %s, but couldn't find", entry.entry.Name)
 				}
 			}
 		})

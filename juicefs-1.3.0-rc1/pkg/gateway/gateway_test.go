@@ -19,16 +19,58 @@ package gateway
 import (
 	"context"
 	"errors"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/fs"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	minio "github.com/minio/minio/cmd"
-	"os"
-	"testing"
-	"time"
 )
+
+type stubVectorExtension struct{}
+
+func (stubVectorExtension) CreateVectorBucket(ctx context.Context, req *vectorbucket.CreateVectorBucketRequest) (*vectorbucket.CreateVectorBucketResponse, error) {
+	return nil, nil
+}
+
+func (stubVectorExtension) GetVectorBucket(ctx context.Context, req *vectorbucket.GetVectorBucketRequest) (*vectorbucket.GetVectorBucketResponse, error) {
+	return nil, nil
+}
+
+func (stubVectorExtension) ListVectorBuckets(ctx context.Context, req *vectorbucket.ListVectorBucketsRequest) (*vectorbucket.ListVectorBucketsResponse, error) {
+	return nil, nil
+}
+
+func (stubVectorExtension) DeleteVectorBucket(ctx context.Context, req *vectorbucket.DeleteVectorBucketRequest) error {
+	return nil
+}
+
+func (stubVectorExtension) CreateIndex(ctx context.Context, req *vectorbucket.CreateIndexRequest) (*vectorbucket.CreateIndexResponse, error) {
+	return nil, nil
+}
+
+func (stubVectorExtension) DeleteIndex(ctx context.Context, req *vectorbucket.DeleteIndexRequest) error {
+	return nil
+}
+
+func (stubVectorExtension) PutVectors(ctx context.Context, req *vectorbucket.PutVectorsRequest) error {
+	return nil
+}
+
+func (stubVectorExtension) DeleteVectors(ctx context.Context, req *vectorbucket.DeleteVectorsRequest) error {
+	return nil
+}
+
+func (stubVectorExtension) QueryVectors(ctx context.Context, req *vectorbucket.QueryVectorsRequest) (*vectorbucket.QueryVectorsResponse, error) {
+	return nil, nil
+}
 
 func TestGatewayLock(t *testing.T) {
 	m := meta.NewClient("memkv://", nil)
@@ -97,4 +139,10 @@ func TestGatewayLock(t *testing.T) {
 	}
 	rwLocker.RUnlock()
 
+}
+
+func TestGatewayCarriesVectorBucketExtension(t *testing.T) {
+	ext := stubVectorExtension{}
+	obj := &jfsObjects{gConf: &Config{VectorBucket: ext}, vectorbucket: ext}
+	require.Equal(t, ext, obj.VectorBucketExtension())
 }

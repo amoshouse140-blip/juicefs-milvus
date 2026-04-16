@@ -37,6 +37,8 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 
 	jfsgateway "github.com/juicedata/juicefs/pkg/gateway"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket"
+	vectorbucketconfig "github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
 	"github.com/urfave/cli/v2"
 
 	mcli "github.com/minio/cli"
@@ -158,21 +160,32 @@ func gateway(c *cli.Context) error {
 	}
 
 	readonly := c.Bool("read-only")
+	vbCfg := vectorbucketconfig.LoadConfig()
+	vbBoot, err := vectorbucket.Bootstrap(context.Background(), vbCfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = vbBoot.Stop(context.Background())
+	}()
+
 	jfsGateway, err = jfsgateway.NewJFSGateway(
 		jfs,
 		conf,
 		&jfsgateway.Config{
-			MultiBucket: c.Bool("multi-buckets"),
-			KeepEtag:    c.Bool("keep-etag"),
-			Umask:       uint16(umask),
-			ObjTag:      c.Bool("object-tag"),
-			ObjMeta:     c.Bool("object-meta"),
-			HeadDir:     c.Bool("head-dir"),
-			HideDir:     c.Bool("hide-dir-object"),
-			ReadOnly:    readonly,
+			MultiBucket:  c.Bool("multi-buckets"),
+			KeepEtag:     c.Bool("keep-etag"),
+			Umask:        uint16(umask),
+			ObjTag:       c.Bool("object-tag"),
+			ObjMeta:      c.Bool("object-meta"),
+			HeadDir:      c.Bool("head-dir"),
+			HideDir:      c.Bool("hide-dir-object"),
+			ReadOnly:     readonly,
+			VectorBucket: vbBoot.Runtime,
 		},
 	)
 	if err != nil {
+		_ = vbBoot.Stop(context.Background())
 		return err
 	}
 	if readonly {
