@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/utils"
 )
+
+var loadLogger = utils.GetLogger("vectorbucket-load")
 
 type LoadReleaser interface {
 	LoadCollection(ctx context.Context, name string) error
@@ -76,6 +80,7 @@ func (c *LoadController) Pin(name string) {
 	defer c.mu.Unlock()
 	if entry, ok := c.entries[name]; ok {
 		entry.Pinned = true
+		loadLogger.Infof("pin collection: physical=%s est_mem_mb=%.2f", name, entry.EstMemMB)
 	}
 }
 
@@ -84,6 +89,7 @@ func (c *LoadController) Unpin(name string) {
 	defer c.mu.Unlock()
 	if entry, ok := c.entries[name]; ok {
 		entry.Pinned = false
+		loadLogger.Infof("unpin collection: physical=%s", name)
 	}
 }
 
@@ -101,13 +107,16 @@ func (c *LoadController) Release(ctx context.Context, name string) error {
 	if !ok {
 		return nil
 	}
+	loadLogger.Infof("release collection requested: physical=%s", name)
 	if err := c.adapter.ReleaseCollection(ctx, name); err != nil {
+		loadLogger.Errorf("release collection failed: physical=%s err=%v", name, err)
 		return err
 	}
 	c.mu.Lock()
 	delete(c.entries, name)
 	c.removeLRU(name)
 	c.mu.Unlock()
+	loadLogger.Infof("release collection completed: physical=%s", name)
 	return nil
 }
 
@@ -133,6 +142,7 @@ func (c *LoadController) EnsureLoaded(ctx context.Context, name string, estMemMB
 		entry.LastAccessAt = time.Now()
 		c.moveLRUToBack(name)
 		c.mu.Unlock()
+		loadLogger.Infof("ensure loaded hit cache: physical=%s pinned=%t est_mem_mb=%.2f", name, entry.Pinned, entry.EstMemMB)
 		return nil
 	}
 	c.mu.Unlock()
@@ -146,6 +156,7 @@ func (c *LoadController) EnsureLoaded(ctx context.Context, name string, estMemMB
 		entry.LastAccessAt = time.Now()
 		c.moveLRUToBack(name)
 		c.mu.Unlock()
+		loadLogger.Infof("ensure loaded hit cache after wait: physical=%s pinned=%t est_mem_mb=%.2f", name, entry.Pinned, entry.EstMemMB)
 		return nil
 	}
 	if err := c.evictIfNeededLocked(estMemMB); err != nil {
@@ -155,6 +166,7 @@ func (c *LoadController) EnsureLoaded(ctx context.Context, name string, estMemMB
 	c.mu.Unlock()
 
 	if err := c.adapter.LoadCollection(ctx, name); err != nil {
+		loadLogger.Errorf("load collection failed: physical=%s est_mem_mb=%.2f err=%v", name, estMemMB, err)
 		return fmt.Errorf("load collection %s: %w", name, err)
 	}
 
@@ -168,6 +180,7 @@ func (c *LoadController) EnsureLoaded(ctx context.Context, name string, estMemMB
 		EstMemMB:     estMemMB,
 	}
 	c.lruOrder = append(c.lruOrder, name)
+	loadLogger.Infof("load collection completed: physical=%s est_mem_mb=%.2f loaded_count=%d used_mb=%.2f", name, estMemMB, len(c.entries), c.usedMBLocked())
 	return nil
 }
 
@@ -186,6 +199,7 @@ func (c *LoadController) RunTTLSweep() {
 	c.mu.Unlock()
 
 	for _, name := range toRelease {
+		loadLogger.Infof("ttl sweep releasing collection: physical=%s", name)
 		_ = c.adapter.ReleaseCollection(context.Background(), name)
 		c.mu.Lock()
 		delete(c.entries, name)
@@ -230,6 +244,7 @@ func (c *LoadController) evictIfNeededLocked(neededMB float64) error {
 			if err := c.adapter.ReleaseCollection(context.Background(), candidate); err != nil {
 				return fmt.Errorf("release collection %s: %w", candidate, err)
 			}
+			loadLogger.Infof("evict collection by lru: physical=%s used_mb=%.2f needed_mb=%.2f budget_mb=%.2f", candidate, c.usedMBLocked(), neededMB, c.budgetMB)
 			delete(c.entries, candidate)
 			c.removeLRU(candidate)
 			evicted = true

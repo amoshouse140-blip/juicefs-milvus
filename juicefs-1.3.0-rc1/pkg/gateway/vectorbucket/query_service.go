@@ -12,7 +12,10 @@ import (
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metrics"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
+
+var queryLogger = utils.GetLogger("vectorbucket-query")
 
 type QueryService struct {
 	store      metadata.Store
@@ -43,8 +46,10 @@ func (s *QueryService) QueryVectors(ctx context.Context, req *QueryVectorsReques
 	if estMem <= 0 {
 		estMem = controller.EstimateMemMB(coll.VectorCount, coll.Dim)
 	}
+	queryLogger.Infof("query vectors routing: bucket=%s index=%s physical=%s model=%s tier=%s topk=%d est_mem_mb=%.2f", bucketName, indexName, coll.PhysicalName, coll.IndexType, coll.Tier, req.TopK, estMem)
 	loadStarted := time.Now()
 	if err := s.controller.EnsureLoaded(ctx, coll.PhysicalName, estMem); err != nil {
+		queryLogger.Errorf("query ensure load failed: bucket=%s index=%s physical=%s err=%v", bucketName, indexName, coll.PhysicalName, err)
 		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
 	}
 	metrics.LoadDuration.WithLabelValues(coll.Tier).Observe(time.Since(loadStarted).Seconds())
@@ -67,6 +72,7 @@ func (s *QueryService) QueryVectors(ctx context.Context, req *QueryVectorsReques
 		TopK:              req.TopK,
 	})
 	if err != nil {
+		queryLogger.Errorf("query search failed: bucket=%s index=%s physical=%s model=%s err=%v", bucketName, indexName, coll.PhysicalName, coll.IndexType, err)
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	metrics.QueryDuration.WithLabelValues("search", coll.Tier).Observe(time.Since(searchStarted).Seconds())
@@ -85,5 +91,6 @@ func (s *QueryService) QueryVectors(ctx context.Context, req *QueryVectorsReques
 		}
 		resp.Vectors = append(resp.Vectors, item)
 	}
+	queryLogger.Infof("query vectors completed: bucket=%s index=%s physical=%s result_count=%d", bucketName, indexName, coll.PhysicalName, len(resp.Vectors))
 	return resp, nil
 }

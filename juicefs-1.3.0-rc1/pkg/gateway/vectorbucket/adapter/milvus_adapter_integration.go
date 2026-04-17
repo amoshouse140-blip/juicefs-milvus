@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/milvus-io/milvus/client/v2/column"
 	"github.com/milvus-io/milvus/client/v2/entity"
 	"github.com/milvus-io/milvus/client/v2/index"
@@ -19,6 +20,8 @@ import (
 )
 
 const primaryKeyMaxLength = 1024
+
+var milvusLogger = utils.GetLogger("vectorbucket-milvus")
 
 type MilvusAdapter struct {
 	addr   string
@@ -158,7 +161,13 @@ func (a *MilvusAdapter) CreateIndex(ctx context.Context, name string, spec Index
 	if err != nil {
 		return err
 	}
-	return submitCreateIndex(ctx, createIndexClientAdapter{client: client}, name, spec)
+	milvusLogger.Infof("create milvus index requested: physical=%s model=%s tier=%s metric=%s vector_count=%d", name, spec.IndexType, spec.Tier, spec.Metric, spec.VectorCount)
+	if err := submitCreateIndex(ctx, createIndexClientAdapter{client: client}, name, spec); err != nil {
+		milvusLogger.Errorf("create milvus index failed: physical=%s model=%s err=%v", name, spec.IndexType, err)
+		return err
+	}
+	milvusLogger.Infof("create milvus index completed: physical=%s model=%s", name, spec.IndexType)
+	return nil
 }
 
 func (a *MilvusAdapter) LoadCollection(ctx context.Context, name string) error {
@@ -166,11 +175,18 @@ func (a *MilvusAdapter) LoadCollection(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	milvusLogger.Infof("load milvus collection requested: physical=%s", name)
 	task, err := client.LoadCollection(ctx, milvusclient.NewLoadCollectionOption(name))
 	if err != nil {
+		milvusLogger.Errorf("load milvus collection failed to start: physical=%s err=%v", name, err)
 		return err
 	}
-	return task.Await(ctx)
+	if err := task.Await(ctx); err != nil {
+		milvusLogger.Errorf("load milvus collection await failed: physical=%s err=%v", name, err)
+		return err
+	}
+	milvusLogger.Infof("load milvus collection completed: physical=%s", name)
+	return nil
 }
 
 func (a *MilvusAdapter) ReleaseCollection(ctx context.Context, name string) error {
@@ -178,7 +194,13 @@ func (a *MilvusAdapter) ReleaseCollection(ctx context.Context, name string) erro
 	if err != nil {
 		return err
 	}
-	return client.ReleaseCollection(ctx, milvusclient.NewReleaseCollectionOption(name))
+	milvusLogger.Infof("release milvus collection requested: physical=%s", name)
+	if err := client.ReleaseCollection(ctx, milvusclient.NewReleaseCollectionOption(name)); err != nil {
+		milvusLogger.Errorf("release milvus collection failed: physical=%s err=%v", name, err)
+		return err
+	}
+	milvusLogger.Infof("release milvus collection completed: physical=%s", name)
+	return nil
 }
 
 func (a *MilvusAdapter) Insert(ctx context.Context, name string, ids []string, vectors [][]float32, metadataJSON [][]byte, timestamps []int64) error {
@@ -240,6 +262,7 @@ func (a *MilvusAdapter) Search(ctx context.Context, name string, vector []float3
 	if err != nil {
 		return nil, err
 	}
+	milvusLogger.Infof("search milvus collection requested: physical=%s model=%s topk=%d", name, spec.IndexType, spec.TopK)
 	opt := milvusclient.NewSearchOption(name, spec.TopK, []entity.Vector{entity.FloatVector(vector)}).
 		WithANNSField("vector").
 		WithOutputFields("metadata")
@@ -256,6 +279,7 @@ func (a *MilvusAdapter) Search(ctx context.Context, name string, vector []float3
 	}
 	results, err := client.Search(ctx, opt)
 	if err != nil {
+		milvusLogger.Errorf("search milvus collection failed: physical=%s model=%s err=%v", name, spec.IndexType, err)
 		return nil, err
 	}
 
@@ -283,6 +307,7 @@ func (a *MilvusAdapter) Search(ctx context.Context, name string, vector []float3
 			out = append(out, item)
 		}
 	}
+	milvusLogger.Infof("search milvus collection completed: physical=%s model=%s result_count=%d", name, spec.IndexType, len(out))
 	return out, nil
 }
 
@@ -291,6 +316,7 @@ func (a *MilvusAdapter) Scan(ctx context.Context, name string, batchSize int, fn
 	if err != nil {
 		return err
 	}
+	milvusLogger.Infof("scan milvus collection requested: physical=%s batch_size=%d", name, batchSize)
 	if batchSize <= 0 {
 		batchSize = 1000
 	}
@@ -298,18 +324,23 @@ func (a *MilvusAdapter) Scan(ctx context.Context, name string, batchSize int, fn
 		WithBatchSize(batchSize).
 		WithOutputFields("id", "vector", "metadata", "created_at"))
 	if err != nil {
+		milvusLogger.Errorf("scan milvus collection failed to create iterator: physical=%s err=%v", name, err)
 		return err
 	}
 
+	totalRows := 0
 	for {
 		rs, err := iter.Next(ctx)
 		if err != nil {
 			if err == io.EOF {
+				milvusLogger.Infof("scan milvus collection completed: physical=%s rows=%d", name, totalRows)
 				return nil
 			}
+			milvusLogger.Errorf("scan milvus collection next failed: physical=%s err=%v", name, err)
 			return err
 		}
 		if rs.ResultCount == 0 {
+			milvusLogger.Infof("scan milvus collection completed: physical=%s rows=%d", name, totalRows)
 			return nil
 		}
 		idColumn := rs.GetColumn("id")
@@ -351,7 +382,9 @@ func (a *MilvusAdapter) Scan(ctx context.Context, name string, batchSize int, fn
 			}
 			rows = append(rows, record)
 		}
+		totalRows += len(rows)
 		if err := fn(rows); err != nil {
+			milvusLogger.Errorf("scan milvus collection callback failed: physical=%s processed_rows=%d err=%v", name, totalRows, err)
 			return err
 		}
 	}
@@ -362,17 +395,21 @@ func (a *MilvusAdapter) Count(ctx context.Context, name string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	milvusLogger.Infof("count milvus collection requested: physical=%s", name)
 	stats, err := client.GetCollectionStats(ctx, milvusclient.NewGetCollectionStatsOption(name))
 	if err != nil {
+		milvusLogger.Errorf("count milvus collection failed: physical=%s err=%v", name, err)
 		return 0, err
 	}
 	for _, key := range []string{"row_count", "count"} {
 		if value, ok := stats[key]; ok {
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err == nil {
+				milvusLogger.Infof("count milvus collection completed: physical=%s count=%d", name, n)
 				return n, nil
 			}
 		}
 	}
+	milvusLogger.Errorf("count milvus collection missing row count: physical=%s", name)
 	return 0, fmt.Errorf("row count not found for collection %s", name)
 }
