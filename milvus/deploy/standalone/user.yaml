@@ -1,0 +1,22 @@
+etcd:
+  endpoints:
+    - etcd:2379
+  rootPath: by-jfs-standalone
+
+minio:
+  address: host.docker.internal
+  port: 9000
+  accessKeyID: admin
+  secretAccessKey: 12345678
+  useSSL: false
+  bucketName: jfs-milvus
+  rootPath: milvus-storage/files
+  useIAM: false
+  cloudProvider: aws
+
+mq:
+  type: woodpecker
+
+woodpecker:
+  storage:
+    type: minio

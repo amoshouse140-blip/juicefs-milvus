@@ -9,6 +9,7 @@ import (
 )
 
 const vectorAPIDefaultRegion = "us-east-1"
+const vectorAPIMaxRequestBodySize = 20 << 20
 
 func (api objectAPIHandlers) vectorAPI() VectorAPI {
 	objectAPI := api.ObjectAPI()
@@ -36,7 +37,7 @@ func vectorRequestContext(r *http.Request) RequestContext {
 }
 
 func decodeVectorRequest(r *http.Request, dst interface{}) error {
-	return json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(dst)
+	return json.NewDecoder(io.LimitReader(r.Body, vectorAPIMaxRequestBodySize)).Decode(dst)
 }
 
 func writeVectorSuccess(w http.ResponseWriter, resp interface{}) {

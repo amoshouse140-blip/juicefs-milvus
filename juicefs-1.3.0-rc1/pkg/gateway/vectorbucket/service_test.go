@@ -21,6 +21,7 @@ type stubAdapter struct {
 	upserts     []string
 	deletes     []string
 	search      []adapter.SearchResult
+	createIndex []string
 }
 
 func newStubAdapter() *stubAdapter {
@@ -43,6 +44,7 @@ func (s *stubAdapter) HasCollection(ctx context.Context, name string) (bool, err
 }
 
 func (s *stubAdapter) CreateIndex(ctx context.Context, name string, vectorCount int64, metric string) error {
+	s.createIndex = append(s.createIndex, name)
 	return nil
 }
 
@@ -131,6 +133,7 @@ func TestIndexWriteQueryLifecycle(t *testing.T) {
 		DistanceMetric: "cosine",
 	})
 	require.NoError(t, err)
+	assert.Len(t, adp.createIndex, 1)
 
 	err = runtime.PutVectors(context.Background(), &PutVectorsRequest{
 		RequestContext: RequestContext{AccountID: "123456789012", Region: "us-east-1"},
@@ -141,6 +144,7 @@ func TestIndexWriteQueryLifecycle(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"v1"}, adp.upserts)
+	assert.Len(t, adp.createIndex, 1)
 
 	adp.search = []adapter.SearchResult{{ID: "v1", Score: 0.9, Metadata: []byte(`{"tenant":"t1"}`)}}
 	queryResp, err := runtime.QueryVectors(context.Background(), &QueryVectorsRequest{

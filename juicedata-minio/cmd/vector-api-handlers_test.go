@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -127,4 +129,23 @@ func TestQueryVectorsHandler(t *testing.T) {
 	require.NotNil(t, layer.queryVectorsReq)
 	require.Equal(t, 5, layer.queryVectorsReq.TopK)
 	require.True(t, layer.queryVectorsReq.ReturnMetadata)
+}
+
+func TestDecodeVectorRequestAllowsPayloadUnder20MiB(t *testing.T) {
+	paddingSize := (20 << 20) - 1024
+	body := bytes.NewBufferString(fmt.Sprintf(`{"vectorBucketName":"demo","indexName":"main","vectors":[{"key":"v1","data":{"float32":[0.1]},"metadata":{"padding":"%s"}}]}`, strings.Repeat("a", paddingSize)))
+	req := httptest.NewRequest(http.MethodPost, "/PutVectors", body)
+
+	var decoded PutVectorsRequest
+	require.NoError(t, decodeVectorRequest(req, &decoded))
+	require.Equal(t, "demo", decoded.VectorBucketName)
+}
+
+func TestDecodeVectorRequestRejectsPayloadOver20MiB(t *testing.T) {
+	paddingSize := 20 << 20
+	body := bytes.NewBufferString(fmt.Sprintf(`{"vectorBucketName":"demo","indexName":"main","vectors":[{"key":"v1","data":{"float32":[0.1]},"metadata":{"padding":"%s"}}]}`, strings.Repeat("a", paddingSize)))
+	req := httptest.NewRequest(http.MethodPost, "/PutVectors", body)
+
+	var decoded PutVectorsRequest
+	require.Error(t, decodeVectorRequest(req, &decoded))
 }

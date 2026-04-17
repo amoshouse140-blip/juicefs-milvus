@@ -29,7 +29,7 @@ func Bootstrap(ctx context.Context, cfg config.Config) (*BootstrapResult, error)
 		return nil, err
 	}
 
-	milvusAdapter, err := adapter.NewMilvusAdapter(cfg.MilvusAddr)
+	milvusAdapter, err := adapter.NewAdapterFromConfig(cfg)
 	if err != nil {
 		_ = store.Close()
 		return nil, err

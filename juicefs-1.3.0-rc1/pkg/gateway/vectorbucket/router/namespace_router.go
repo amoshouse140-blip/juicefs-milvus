@@ -3,12 +3,18 @@ package router
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
 )
 
 func PhysicalCollectionName(bucketID, collectionID string) string {
-	return fmt.Sprintf("vb_%s_%s", bucketID, collectionID)
+	return fmt.Sprintf("vb_%s_%s", sanitizeCollectionToken(bucketID), sanitizeCollectionToken(collectionID))
+}
+
+func sanitizeCollectionToken(token string) string {
+	replacer := strings.NewReplacer("-", "_")
+	return replacer.Replace(token)
 }
 
 type NamespaceRouter struct {

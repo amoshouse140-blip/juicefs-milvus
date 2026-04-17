@@ -6,7 +6,6 @@ package adapter
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/milvus-io/milvus/client/v2/column"
 	"github.com/milvus-io/milvus/client/v2/entity"
@@ -14,26 +13,6 @@ import (
 	"github.com/milvus-io/milvus/client/v2/milvusclient"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 )
-
-type Adapter interface {
-	CreateCollection(ctx context.Context, name string, dim int, metric string) error
-	DropCollection(ctx context.Context, name string) error
-	HasCollection(ctx context.Context, name string) (bool, error)
-	CreateIndex(ctx context.Context, name string, vectorCount int64, metric string) error
-	LoadCollection(ctx context.Context, name string) error
-	ReleaseCollection(ctx context.Context, name string) error
-	Insert(ctx context.Context, name string, ids []string, vectors [][]float32, metadataJSON [][]byte, timestamps []int64) error
-	Upsert(ctx context.Context, name string, ids []string, vectors [][]float32, metadataJSON [][]byte, timestamps []int64) error
-	Delete(ctx context.Context, name string, ids []string) error
-	Search(ctx context.Context, name string, vector []float32, topK int, nprobe int, filter string, metric string) ([]SearchResult, error)
-	Close() error
-}
-
-type SearchResult struct {
-	ID       string
-	Score    float32
-	Metadata []byte
-}
 
 type MilvusAdapter struct {
 	client *milvusclient.Client
@@ -74,19 +53,8 @@ func (a *MilvusAdapter) HasCollection(ctx context.Context, name string) (bool, e
 	return a.client.HasCollection(ctx, milvusclient.NewHasCollectionOption(name))
 }
 
-func computeNlist(vectorCount int64) int {
-	nlist := int(math.Sqrt(float64(vectorCount)) * 4)
-	if nlist < 1024 {
-		nlist = 1024
-	}
-	if nlist > 65536 {
-		nlist = 65536
-	}
-	return nlist
-}
-
 func metricTypeFromString(metric string) entity.MetricType {
-	switch metric {
+	switch normalizeMetric(metric) {
 	case "L2":
 		return entity.L2
 	case "COSINE":
@@ -139,21 +107,6 @@ func (a *MilvusAdapter) Upsert(ctx context.Context, name string, ids []string, v
 func (a *MilvusAdapter) Delete(ctx context.Context, name string, ids []string) error {
 	_, err := a.client.Delete(ctx, milvusclient.NewDeleteOption(name).WithStringIDs("id", ids))
 	return err
-}
-
-func buildIDFilter(ids []string) string {
-	if len(ids) == 0 {
-		return ""
-	}
-	filter := `id in [`
-	for i, id := range ids {
-		if i > 0 {
-			filter += ","
-		}
-		filter += fmt.Sprintf("%q", id)
-	}
-	filter += `]`
-	return filter
 }
 
 func (a *MilvusAdapter) Search(ctx context.Context, name string, vector []float32, topK int, nprobe int, filter string, metric string) ([]SearchResult, error) {

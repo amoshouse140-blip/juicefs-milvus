@@ -73,6 +73,15 @@ func (s *ObjectService) CreateIndex(ctx context.Context, req *CreateIndexRequest
 		_ = s.store.DeleteCollection(ctx, coll.ID)
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
+	if err := s.adapter.CreateIndex(ctx, coll.PhysicalName, coll.VectorCount, coll.Metric); err != nil {
+		_ = s.adapter.DropCollection(ctx, coll.PhysicalName)
+		_ = s.store.DeleteCollection(ctx, coll.ID)
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+	coll.IndexBuilt = true
+	if err := s.store.UpdateCollectionIndexBuilt(ctx, coll.ID, true); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	}
 	if err := s.store.UpdateCollectionStatus(ctx, coll.ID, metadata.CollStatusReady); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
@@ -133,13 +142,6 @@ func (s *ObjectService) PutVectors(ctx context.Context, req *PutVectorsRequest) 
 	}
 	if err := s.store.UpdateCollectionVectorCount(ctx, coll.ID, int64(len(req.Vectors))); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
-	}
-
-	current, err := s.store.GetCollectionByID(ctx, coll.ID)
-	if err == nil && !current.IndexBuilt && current.VectorCount >= int64(s.cfg.IndexBuildThreshold) {
-		if err := s.adapter.CreateIndex(ctx, current.PhysicalName, current.VectorCount, current.Metric); err == nil {
-			_ = s.store.UpdateCollectionIndexBuilt(ctx, current.ID, true)
-		}
 	}
 	return nil
 }

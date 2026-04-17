@@ -8,6 +8,7 @@ import (
 type Config struct {
 	ListenAddr          string
 	MilvusAddr          string
+	MilvusBridgeAddr    string
 	SQLitePath          string
 	LoadBudgetMB        int
 	TTLSeconds          int
@@ -26,6 +27,7 @@ func DefaultConfig() Config {
 	return Config{
 		ListenAddr:          ":9200",
 		MilvusAddr:          "localhost:19530",
+		MilvusBridgeAddr:    "http://127.0.0.1:19531",
 		SQLitePath:          "/var/lib/vectorbucket/metadata.db",
 		LoadBudgetMB:        4096,
 		TTLSeconds:          30 * 60,
@@ -34,7 +36,7 @@ func DefaultConfig() Config {
 		MaxBucketsGlobal:    1000,
 		MaxCollPerBucket:    50,
 		MaxVectorsPerColl:   1000000,
-		MaxDim:              1536,
+		MaxDim:              4096,
 		WriteQPSPerColl:     500,
 		QueryQPSPerColl:     50,
 		MaxLoadedColls:      50,
@@ -60,6 +62,9 @@ func LoadConfig() Config {
 	}
 	if v := os.Getenv("VB_MILVUS_ADDR"); v != "" {
 		cfg.MilvusAddr = v
+	}
+	if v := os.Getenv("VB_MILVUS_BRIDGE_ADDR"); v != "" {
+		cfg.MilvusBridgeAddr = v
 	}
 	if v := os.Getenv("VB_SQLITE_PATH"); v != "" {
 		cfg.SQLitePath = v

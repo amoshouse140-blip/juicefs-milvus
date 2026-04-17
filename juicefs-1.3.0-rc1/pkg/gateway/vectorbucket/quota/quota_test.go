@@ -79,8 +79,9 @@ func TestCanCreateCollectionExceedsLimit(t *testing.T) {
 func TestCheckDimension(t *testing.T) {
 	checker, _ := newTestChecker(t)
 	assert.NoError(t, checker.CheckDimension(768))
-	assert.NoError(t, checker.CheckDimension(1536))
-	assert.Error(t, checker.CheckDimension(2048))
+	assert.NoError(t, checker.CheckDimension(2048))
+	assert.NoError(t, checker.CheckDimension(4096))
+	assert.Error(t, checker.CheckDimension(4097))
 	assert.Error(t, checker.CheckDimension(0))
 }
 

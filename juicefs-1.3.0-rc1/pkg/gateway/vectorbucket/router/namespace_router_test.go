@@ -22,6 +22,7 @@ func newTestRouter(t *testing.T) *NamespaceRouter {
 
 func TestPhysicalName(t *testing.T) {
 	assert.Equal(t, "vb_b1_c1", PhysicalCollectionName("b1", "c1"))
+	assert.Equal(t, "vb_bucket_id_coll_id", PhysicalCollectionName("bucket-id", "coll-id"))
 }
 
 func TestResolveCollection(t *testing.T) {
