@@ -2134,6 +2134,8 @@ func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFuncti
 			apiRouter.Methods(http.MethodPost).Path("/CreateIndex").HandlerFunc(api.CreateIndexHandler)
 		case "DeleteIndex":
 			apiRouter.Methods(http.MethodPost).Path("/DeleteIndex").HandlerFunc(api.DeleteIndexHandler)
+		case "ChangeIndexModel":
+			apiRouter.Methods(http.MethodPost).Path("/ChangeIndexModel").HandlerFunc(api.ChangeIndexModelHandler)
 		case "PutVectors":
 			apiRouter.Methods(http.MethodPost).Path("/PutVectors").HandlerFunc(api.PutVectorsHandler)
 		case "DeleteVectors":

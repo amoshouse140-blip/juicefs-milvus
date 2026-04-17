@@ -60,6 +60,10 @@ func (stubVectorExtension) DeleteIndex(ctx context.Context, req *vectorbucket.De
 	return nil
 }
 
+func (stubVectorExtension) ChangeIndexModel(ctx context.Context, req *vectorbucket.ChangeIndexModelRequest) (*vectorbucket.ChangeIndexModelResponse, error) {
+	return nil, nil
+}
+
 func (stubVectorExtension) PutVectors(ctx context.Context, req *vectorbucket.PutVectorsRequest) error {
 	return nil
 }

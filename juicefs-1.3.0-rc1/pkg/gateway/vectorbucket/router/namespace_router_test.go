@@ -25,6 +25,12 @@ func TestPhysicalName(t *testing.T) {
 	assert.Equal(t, "vb_bucket_id_coll_id", PhysicalCollectionName("bucket-id", "coll-id"))
 }
 
+func TestPhysicalNameForTier(t *testing.T) {
+	assert.Equal(t, "vb_b1_c1", PhysicalCollectionNameForTier("standard", "b1", "c1"))
+	assert.Equal(t, "vb_b1_c1", PhysicalCollectionNameForTier("", "b1", "c1"))
+	assert.Equal(t, "vbh_bucket_id_coll_id", PhysicalCollectionNameForTier("performance", "bucket-id", "coll-id"))
+}
+
 func TestResolveCollection(t *testing.T) {
 	r := newTestRouter(t)
 	ctx := context.Background()

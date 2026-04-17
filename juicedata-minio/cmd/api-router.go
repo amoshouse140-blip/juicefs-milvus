@@ -191,6 +191,7 @@ func registerAPIRouter(router *mux.Router) {
 	apiRouter.Methods(http.MethodPost).Path("/DeleteVectorBucket").HandlerFunc(collectAPIStats("deletevectorbucket", httpTraceAll(api.DeleteVectorBucketHandler)))
 	apiRouter.Methods(http.MethodPost).Path("/CreateIndex").HandlerFunc(collectAPIStats("createindex", httpTraceAll(api.CreateIndexHandler)))
 	apiRouter.Methods(http.MethodPost).Path("/DeleteIndex").HandlerFunc(collectAPIStats("deleteindex", httpTraceAll(api.DeleteIndexHandler)))
+	apiRouter.Methods(http.MethodPost).Path("/ChangeIndexModel").HandlerFunc(collectAPIStats("changeindexmodel", httpTraceAll(api.ChangeIndexModelHandler)))
 	apiRouter.Methods(http.MethodPost).Path("/PutVectors").HandlerFunc(collectAPIStats("putvectors", httpTraceAll(api.PutVectorsHandler)))
 	apiRouter.Methods(http.MethodPost).Path("/DeleteVectors").HandlerFunc(collectAPIStats("deletevectors", httpTraceAll(api.DeleteVectorsHandler)))
 	apiRouter.Methods(http.MethodPost).Path("/QueryVectors").HandlerFunc(collectAPIStats("queryvectors", httpTraceAll(api.QueryVectorsHandler)))

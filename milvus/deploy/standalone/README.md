@@ -8,12 +8,21 @@
 - Docker and Docker Compose
 - `mc`, `curl`, and `nc`
 
+## Recommended local workflow
+
+Use the repository scripts instead of running the individual setup commands by hand:
+
+```bash
+./scripts/start-vectorbucket-standalone.sh
+python3 scripts/test-vectorbucket-boto3.py
+./scripts/stop-vectorbucket-standalone.sh
+```
+
 Ports used by this setup:
 
 - `9000` for JuiceFS S3 Gateway
 - `2379` for etcd
 - `19530` for Milvus gRPC
-- `19531` for the VectorBucket Milvus bridge
 - `9091` for Milvus health endpoint
 
 ## Local directories
@@ -66,43 +75,55 @@ docker compose logs standalone --tail=200
 curl -f http://127.0.0.1:9091/healthz
 ```
 
-## Start the VectorBucket Milvus bridge
-
-```bash
-./milvus/scripts/run-vectorbucket-bridge.sh
-```
-
-Or run it manually:
-
-```bash
-cd milvus/bridge
-export MILVUS_ADDR=127.0.0.1:19530
-export BRIDGE_LISTEN_ADDR=:19531
-GOWORK=off go run ./cmd/vectorbucket-milvus-bridge
-```
-
-Verify:
-
-```bash
-curl -f http://127.0.0.1:19531/healthz
-```
-
 ## VectorBucket runtime environment on JuiceFS
 
 ```bash
 export MINIO_ROOT_USER=admin
 export MINIO_ROOT_PASSWORD=12345678
 export VB_SQLITE_PATH=/var/lib/vectorbucket/metadata.db
-export VB_MILVUS_BRIDGE_ADDR=http://127.0.0.1:19531
+export VB_MILVUS_ADDR=127.0.0.1:19530
 ```
 
-`VB_MILVUS_ADDR` is only needed when building JuiceFS with the optional in-process `milvus_integration` tag.
+VectorBucket index model is now driven by the repository config file:
 
-## Build JuiceFS for scheme B
+- [configs/vectorbucket.json](/Users/xty/code/juicefs-milvus/configs/vectorbucket.json)
+
+Example:
+
+```json
+{
+  "bucketIndexPolicies": {
+    "bench-ivf": {
+      "indexType": "ivf_sq8"
+    },
+    "bench-hnsw": {
+      "indexType": "hnsw",
+      "maxVectors": 200000,
+      "hnswM": 16,
+      "hnswEfConstruction": 200
+    },
+    "bench-diskann": {
+      "indexType": "diskann",
+      "maxVectors": 300000,
+      "diskannSearchList": 100
+    }
+  }
+}
+```
+
+Supported `indexType` values:
+
+- `ivf_sq8`: on-demand load + LRU/TTL
+- `hnsw`: pinned/load-resident
+- `diskann`: pinned/load-resident
+
+The public S3 Vectors API does not change. `boto3` still uses the standard `create_vector_bucket/create_index/...` calls; JuiceFS decides the backend index model from the bucket policy at index creation time.
+
+## Build JuiceFS with in-process Milvus integration
 
 ```bash
 cd juicefs-1.3.0-rc1
-GOWORK=off go build -o ./juicefs ./cmd/juicefs
+GOWORK=off go build -tags milvus_integration -o ./juicefs .
 ```
 
 ## Start the JuiceFS Gateway
@@ -112,10 +133,10 @@ cd juicefs-1.3.0-rc1
 ./juicefs gateway redis://127.0.0.1:6379/1 127.0.0.1:9000
 ```
 
-## End-to-end smoke test
+## End-to-end boto3 smoke test
 
 ```bash
-./milvus/scripts/test-vectorbucket.sh http://127.0.0.1:9000
+python3 scripts/test-vectorbucket-boto3.py
 ```
 
 ## Vector Bucket benchmark
@@ -123,19 +144,70 @@ cd juicefs-1.3.0-rc1
 Install benchmark dependencies:
 
 ```bash
-.runtime/venv-boto3/bin/pip install -r milvus/scripts/requirements-benchmark.txt
+python3 -m pip install --user boto3 -r scripts/requirements-benchmark.txt
 ```
 
 Run the three supported profiles:
 
 ```bash
-.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 10k
-.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 100k
-.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 1m
+python3 scripts/test-vectorbucket-benchmark.py --profile 10k
+python3 scripts/test-vectorbucket-benchmark.py --profile 100k
+python3 scripts/test-vectorbucket-benchmark.py --profile 1m
 ```
 
+To benchmark an `hnsw` bucket, target a bucket configured with `"indexType": "hnsw"` in `configs/vectorbucket.json`:
+
+```bash
+VECTOR_BUCKET_NAME=bench-hnsw python3 scripts/test-vectorbucket-boto3.py
+
+python3 scripts/test-vectorbucket-benchmark.py \
+  --profile 10k \
+  --vector-bucket-name bench-hnsw \
+  --cleanup
+```
+
+To benchmark an `ivf_sq8` bucket explicitly:
+
+```bash
+python3 scripts/test-vectorbucket-benchmark.py \
+  --profile 10k \
+  --vector-bucket-name bench-ivf \
+  --cleanup
+```
+
+To benchmark a `diskann` bucket:
+
+```bash
+VECTOR_BUCKET_NAME=bench-diskann python3 scripts/test-vectorbucket-boto3.py
+
+python3 scripts/test-vectorbucket-benchmark.py \
+  --profile 10k \
+  --vector-bucket-name bench-diskann \
+  --cleanup
+```
+
+## Manual hot switch
+
+Phase 3a adds an internal management action for manual index model switching. This is not part of the standard boto3 S3 Vectors API.
+
+Example:
+
+```bash
+python3 scripts/change-index-model.py \
+  --vector-bucket-name bench-ivf \
+  --index-name main \
+  --target-model hnsw
+```
+
+Behavior:
+
+- writes are rejected with `503` while migration is in progress
+- queries continue serving from the old physical collection until cutover
+- the script polls `.runtime/vectorbucket/metadata.db` until migration finishes or fails
+
 Reports are written to `.runtime/benchmarks/`.
-The script defaults to `--batch-size 20` because the `DBpedia OpenAI 1M` dataset uses 2048-dimensional vectors and larger JSON batches are significantly heavier on the local Gateway bridge path.
+The script defaults to `--batch-size 20` because the `DBpedia OpenAI 1M` dataset uses 2048-dimensional vectors and larger JSON batches are significantly heavier on the local Gateway and VectorBucket path.
+For `milvus_integration`, you can usually start from `--batch-size 100` or `200` and tune from there.
 
 ## Verify Milvus data lands on JuiceFS
 
@@ -147,8 +219,11 @@ mc find jfs/milvus-storage
 Success means:
 
 - Milvus gRPC is reachable on `:19530`
-- The VectorBucket Milvus bridge is reachable on `:19531`
 - JuiceFS gateway is reachable on `:9000`
 - VectorBucket API requests return success
 - `QueryVectors` returns a result
 - Milvus backend objects appear under `jfs/milvus-storage/files`
+
+## Historical note
+
+`vectorbucket-milvus-bridge` remains in the repository as a fallback and comparison path, but the preferred deployment path is now `milvus_integration`, where JuiceFS talks to Milvus directly in-process.

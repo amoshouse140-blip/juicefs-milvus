@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,4 +158,177 @@ func TestCountCollections(t *testing.T) {
 	cnt, err := s.CountCollections(ctx, "b1")
 	require.NoError(t, err)
 	assert.Equal(t, 2, cnt)
+}
+
+func TestSQLiteStorePersistsCollectionTierFields(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	bucket := &Bucket{
+		ID:        "b1",
+		Name:      "demo",
+		Owner:     "acct",
+		Status:    BucketStatusReady,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	require.NoError(t, s.CreateBucket(ctx, bucket))
+
+	coll := &LogicalCollection{
+		ID:           "c1",
+		BucketID:     "b1",
+		Name:         "main",
+		Dim:          768,
+		Metric:       "COSINE",
+		IndexType:    "hnsw",
+		Status:       CollStatusReady,
+		PhysicalName: "vbh_b1_c1",
+		Tier:         "performance",
+		MaxVectors:   200000,
+		Pinned:       true,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	require.NoError(t, s.CreateCollection(ctx, coll))
+
+	got, err := s.GetCollection(ctx, "b1", "main")
+	require.NoError(t, err)
+	assert.Equal(t, "hnsw", got.IndexType)
+	assert.Equal(t, "performance", got.Tier)
+	assert.Equal(t, int64(200000), got.MaxVectors)
+	assert.True(t, got.Pinned)
+}
+
+func TestSQLiteStorePersistsMigrationFields(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.CreateBucket(ctx, &Bucket{ID: "b-1", Name: "bucket-a", Owner: "acct", Status: BucketStatusReady}))
+
+	coll := &LogicalCollection{
+		ID:                 "lc-1",
+		BucketID:           "b-1",
+		Name:               "main",
+		Dim:                4,
+		Metric:             "COSINE",
+		IndexType:          "ivf_sq8",
+		Tier:               "standard",
+		Status:             CollStatusReady,
+		PhysicalName:       "vb_b_1_lc_1",
+		MigrateState:       "UPGRADING",
+		TargetIndexType:    "hnsw",
+		SourcePhysicalName: "vb_b_1_lc_1",
+		TargetPhysicalName: "vbh_b_1_lc_1",
+		MaintenanceSince:   time.Now().UTC().Truncate(time.Second),
+		LastMigrateError:   "boom",
+	}
+	require.NoError(t, s.CreateCollection(ctx, coll))
+
+	got, err := s.GetCollectionByID(ctx, "lc-1")
+	require.NoError(t, err)
+	assert.Equal(t, "UPGRADING", got.MigrateState)
+	assert.Equal(t, "hnsw", got.TargetIndexType)
+	assert.Equal(t, "vb_b_1_lc_1", got.SourcePhysicalName)
+	assert.Equal(t, "vbh_b_1_lc_1", got.TargetPhysicalName)
+	assert.Equal(t, "boom", got.LastMigrateError)
+	assert.False(t, got.MaintenanceSince.IsZero())
+}
+
+func TestSQLiteStoreUpdatesMigrationState(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.CreateBucket(ctx, &Bucket{ID: "b-1", Name: "bucket-a", Owner: "acct", Status: BucketStatusReady}))
+	require.NoError(t, s.CreateCollection(ctx, &LogicalCollection{
+		ID:           "lc-1",
+		BucketID:     "b-1",
+		Name:         "main",
+		Dim:          4,
+		Metric:       "COSINE",
+		IndexType:    "ivf_sq8",
+		Tier:         "standard",
+		Status:       CollStatusReady,
+		PhysicalName: "vb_b_1_lc_1",
+	}))
+
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s.UpdateCollectionMigrationState(ctx, "lc-1", "UPGRADING", "hnsw", "vb_b_1_lc_1", "vbh_b_1_lc_1", now, ""))
+	got, err := s.GetCollectionByID(ctx, "lc-1")
+	require.NoError(t, err)
+	assert.Equal(t, "UPGRADING", got.MigrateState)
+	assert.Equal(t, "hnsw", got.TargetIndexType)
+	assert.Equal(t, "vb_b_1_lc_1", got.SourcePhysicalName)
+	assert.Equal(t, "vbh_b_1_lc_1", got.TargetPhysicalName)
+	assert.WithinDuration(t, now, got.MaintenanceSince, time.Second)
+}
+
+func TestSQLiteStoreSwitchesCollectionPhysicalWithCAS(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.CreateBucket(ctx, &Bucket{ID: "b-1", Name: "bucket-a", Owner: "acct", Status: BucketStatusReady}))
+	require.NoError(t, s.CreateCollection(ctx, &LogicalCollection{
+		ID:                 "lc-1",
+		BucketID:           "b-1",
+		Name:               "main",
+		Dim:                4,
+		Metric:             "COSINE",
+		IndexType:          "ivf_sq8",
+		Tier:               "standard",
+		Status:             CollStatusReady,
+		PhysicalName:       "vb_b_1_lc_1",
+		MigrateState:       "UPGRADING",
+		TargetIndexType:    "hnsw",
+		SourcePhysicalName: "vb_b_1_lc_1",
+		TargetPhysicalName: "vbh_b_1_lc_1",
+	}))
+
+	err := s.SwitchCollectionPhysical(ctx, "lc-1", "wrong-old", "vbh_b_1_lc_1", "hnsw", "performance", true, 200000)
+	require.Error(t, err)
+
+	require.NoError(t, s.SwitchCollectionPhysical(ctx, "lc-1", "vb_b_1_lc_1", "vbh_b_1_lc_1", "hnsw", "performance", true, 200000))
+	got, err := s.GetCollectionByID(ctx, "lc-1")
+	require.NoError(t, err)
+	assert.Equal(t, "vbh_b_1_lc_1", got.PhysicalName)
+	assert.Equal(t, "hnsw", got.IndexType)
+	assert.Equal(t, "performance", got.Tier)
+	assert.True(t, got.Pinned)
+	assert.Equal(t, int64(200000), got.MaxVectors)
+	assert.Empty(t, got.MigrateState)
+	assert.Empty(t, got.TargetIndexType)
+	assert.Empty(t, got.SourcePhysicalName)
+	assert.Empty(t, got.TargetPhysicalName)
+	assert.Empty(t, got.LastMigrateError)
+	assert.True(t, got.MaintenanceSince.IsZero())
+}
+
+func TestSQLiteStoreListsCollectionsInMigration(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.CreateBucket(ctx, &Bucket{ID: "b-1", Name: "bucket-a", Owner: "acct", Status: BucketStatusReady}))
+	require.NoError(t, s.CreateCollection(ctx, &LogicalCollection{
+		ID:           "lc-1",
+		BucketID:     "b-1",
+		Name:         "main",
+		Dim:          4,
+		Metric:       "COSINE",
+		IndexType:    "ivf_sq8",
+		Tier:         "standard",
+		Status:       CollStatusReady,
+		PhysicalName: "vb_b_1_lc_1",
+		MigrateState: "UPGRADING",
+	}))
+	require.NoError(t, s.CreateCollection(ctx, &LogicalCollection{
+		ID:           "lc-2",
+		BucketID:     "b-1",
+		Name:         "other",
+		Dim:          4,
+		Metric:       "COSINE",
+		IndexType:    "ivf_sq8",
+		Tier:         "standard",
+		Status:       CollStatusReady,
+		PhysicalName: "vb_b_1_lc_2",
+	}))
+
+	list, err := s.ListCollectionsInMigration(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "lc-1", list[0].ID)
 }

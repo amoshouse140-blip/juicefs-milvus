@@ -111,6 +111,18 @@ type DeleteIndexRequest struct {
 	Target
 }
 
+type ChangeIndexModelRequest struct {
+	RequestContext
+	Target
+	IndexModel string `json:"indexModel"`
+}
+
+type ChangeIndexModelResponse struct {
+	IndexARN   string `json:"indexArn"`
+	IndexModel string `json:"indexModel"`
+	State      string `json:"state"`
+}
+
 type PutVectorsRequest struct {
 	RequestContext
 	Target
@@ -145,6 +157,7 @@ type VectorAPI interface {
 	DeleteVectorBucket(context.Context, *DeleteVectorBucketRequest) error
 	CreateIndex(context.Context, *CreateIndexRequest) (*CreateIndexResponse, error)
 	DeleteIndex(context.Context, *DeleteIndexRequest) error
+	ChangeIndexModel(context.Context, *ChangeIndexModelRequest) (*ChangeIndexModelResponse, error)
 	PutVectors(context.Context, *PutVectorsRequest) error
 	DeleteVectors(context.Context, *DeleteVectorsRequest) error
 	QueryVectors(context.Context, *QueryVectorsRequest) (*QueryVectorsResponse, error)

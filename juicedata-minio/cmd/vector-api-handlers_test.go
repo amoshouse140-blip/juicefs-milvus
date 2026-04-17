@@ -16,6 +16,7 @@ import (
 type vectorTestObjectLayer struct {
 	ObjectLayer
 	createBucketReq *CreateVectorBucketRequest
+	changeIndexModelReq *ChangeIndexModelRequest
 	putVectorsReq   *PutVectorsRequest
 	queryVectorsReq *QueryVectorsRequest
 }
@@ -43,6 +44,11 @@ func (v *vectorTestObjectLayer) CreateIndex(ctx context.Context, req *CreateInde
 
 func (v *vectorTestObjectLayer) DeleteIndex(ctx context.Context, req *DeleteIndexRequest) error {
 	return nil
+}
+
+func (v *vectorTestObjectLayer) ChangeIndexModel(ctx context.Context, req *ChangeIndexModelRequest) (*ChangeIndexModelResponse, error) {
+	v.changeIndexModelReq = req
+	return &ChangeIndexModelResponse{IndexARN: "arn:aws:s3vectors:us-east-1:123456789012:bucket/demo/index/main", IndexModel: req.IndexModel, State: "UPGRADING"}, nil
 }
 
 func (v *vectorTestObjectLayer) PutVectors(ctx context.Context, req *PutVectorsRequest) error {
@@ -129,6 +135,27 @@ func TestQueryVectorsHandler(t *testing.T) {
 	require.NotNil(t, layer.queryVectorsReq)
 	require.Equal(t, 5, layer.queryVectorsReq.TopK)
 	require.True(t, layer.queryVectorsReq.ReturnMetadata)
+}
+
+func TestChangeIndexModelHandler(t *testing.T) {
+	layer, router := newVectorTestRouter(t, "ChangeIndexModel")
+
+	body := bytes.NewBufferString(`{"vectorBucketName":"demo","indexName":"main","indexModel":"hnsw"}`)
+	req := httptest.NewRequest(http.MethodPost, "/ChangeIndexModel", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp ChangeIndexModelResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Equal(t, "hnsw", resp.IndexModel)
+	require.Equal(t, "UPGRADING", resp.State)
+	require.NotNil(t, layer.changeIndexModelReq)
+	require.Equal(t, "demo", layer.changeIndexModelReq.VectorBucketName)
+	require.Equal(t, "main", layer.changeIndexModelReq.IndexName)
+	require.Equal(t, "hnsw", layer.changeIndexModelReq.IndexModel)
 }
 
 func TestDecodeVectorRequestAllowsPayloadUnder20MiB(t *testing.T) {

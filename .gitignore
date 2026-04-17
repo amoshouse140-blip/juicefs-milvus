@@ -1,1 +1,3 @@
 .worktrees/
+.runtime/
+milvus/deploy/standalone/volumes/

@@ -90,3 +90,39 @@ func TestCheckVectorCount(t *testing.T) {
 	assert.NoError(t, checker.CheckVectorCount(999999, 1))
 	assert.Error(t, checker.CheckVectorCount(999999, 2))
 }
+
+func TestCanCreatePerformanceCollectionExceedsBudget(t *testing.T) {
+	checker, store := newTestChecker(t)
+	checker.cfg.PerformanceBudgetMB = 100
+	ctx := context.Background()
+
+	require.NoError(t, store.CreateBucket(ctx, &metadata.Bucket{
+		ID: "b1", Name: "hot-a", Owner: "u1", Status: metadata.BucketStatusReady,
+	}))
+	require.NoError(t, store.CreateBucket(ctx, &metadata.Bucket{
+		ID: "b2", Name: "hot-b", Owner: "u1", Status: metadata.BucketStatusReady,
+	}))
+	require.NoError(t, store.CreateCollection(ctx, &metadata.LogicalCollection{
+		ID:           "c1",
+		BucketID:     "b1",
+		Name:         "main",
+		Dim:          2048,
+		Metric:       "COSINE",
+		Tier:         "performance",
+		MaxVectors:   10000,
+		Pinned:       true,
+		Status:       metadata.CollStatusReady,
+		PhysicalName: "vbh_b1_c1",
+	}))
+
+	err := checker.CanCreatePerformanceCollection(ctx, 10000, 2048)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "performance memory budget")
+}
+
+func TestCheckPerformanceVectorLimit(t *testing.T) {
+	checker, _ := newTestChecker(t)
+
+	assert.NoError(t, checker.CheckPerformanceVectorLimit(99999, 1, 100000))
+	assert.Error(t, checker.CheckPerformanceVectorLimit(100000, 1, 100000))
+}

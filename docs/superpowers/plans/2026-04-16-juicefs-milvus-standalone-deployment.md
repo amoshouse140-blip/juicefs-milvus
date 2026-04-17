@@ -12,7 +12,7 @@
 
 ## File Structure
 
-本计划默认落地在 `juicefs-milvus` 仓库根目录，部署文件与说明集中到 `milvus/docs/superpowers/` 旁边的执行目录里，避免污染 JuiceFS 源码主路径。
+本计划默认落地在 `juicefs-milvus` 仓库根目录，部署文件与说明集中到 `docs/superpowers/` 旁边的执行目录里，避免污染 JuiceFS 源码主路径。
 
 ### 计划涉及的文件
 
@@ -20,7 +20,7 @@
 - Create: `milvus/deploy/standalone/milvus.yaml`
 - Create: `milvus/deploy/standalone/.env.example`
 - Create: `milvus/deploy/standalone/README.md`
-- Create: `milvus/scripts/test-vectorbucket.sh`
+- Create: `scripts/test-vectorbucket-boto3.py`
 - Modify: `juicefs-1.3.0-rc1/go.mod`
 - Modify: `juicefs-1.3.0-rc1/go.sum`
 - Modify: `juicefs-1.3.0-rc1/pkg/gateway/vectorbucket/adapter/milvus_adapter_integration.go` only if Milvus client API version drift requires it
@@ -318,74 +318,72 @@ Expected: exit status 0
 
 ---
 
-### Task 7: Add an End-To-End VectorBucket Smoke Test Script
+### Task 7: Add an End-To-End VectorBucket Boto3 Smoke Test Script
 
 **Files:**
-- Create: `milvus/scripts/test-vectorbucket.sh`
+- Create: `scripts/test-vectorbucket-boto3.py`
 - Modify: `milvus/deploy/standalone/README.md`
 
-- [ ] **Step 1: Create the smoke test script**
+- [ ] **Step 1: Create the boto3 smoke test script**
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+```python
+import boto3
 
-base_url="${1:-http://127.0.0.1:9000}"
+client = boto3.client(
+    "s3vectors",
+    endpoint_url="http://127.0.0.1:9000",
+    region_name="us-east-1",
+    aws_access_key_id="admin",
+    aws_secret_access_key="12345678",
+)
 
-curl -sS -X POST "${base_url}/CreateVectorBucket" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket"}'
-
-curl -sS -X POST "${base_url}/CreateIndex" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket","indexName":"demo-index","dataType":"float32","dimension":4,"distanceMetric":"cosine"}'
-
-curl -sS -X POST "${base_url}/PutVectors" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket","indexName":"demo-index","vectors":[{"key":"v1","data":{"float32":[0.1,0.2,0.3,0.4]},"metadata":{"tenant":"t1"}}]}'
-
-curl -sS -X POST "${base_url}/QueryVectors" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket","indexName":"demo-index","queryVector":{"float32":[0.1,0.2,0.3,0.4]},"topK":5,"returnDistance":true,"returnMetadata":true}'
-
-curl -sS -X POST "${base_url}/DeleteVectors" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket","indexName":"demo-index","keys":["v1"]}'
-
-curl -sS -X POST "${base_url}/DeleteIndex" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket","indexName":"demo-index"}'
-
-curl -sS -X POST "${base_url}/DeleteVectorBucket" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Amz-Account-Id: 123456789012' \
-  -d '{"vectorBucketName":"demo-bucket"}'
+client.create_vector_bucket(vectorBucketName="demo-bucket")
+client.create_index(
+    vectorBucketName="demo-bucket",
+    indexName="demo-index",
+    dataType="float32",
+    dimension=4,
+    distanceMetric="cosine",
+)
+client.put_vectors(
+    vectorBucketName="demo-bucket",
+    indexName="demo-index",
+    vectors=[
+        {
+            "key": "v1",
+            "data": {"float32": [0.1, 0.2, 0.3, 0.4]},
+            "metadata": {"tenant": "t1"},
+        }
+    ],
+)
+client.query_vectors(
+    vectorBucketName="demo-bucket",
+    indexName="demo-index",
+    queryVector={"float32": [0.1, 0.2, 0.3, 0.4]},
+    topK=5,
+    returnDistance=True,
+    returnMetadata=True,
+)
 ```
 
-- [ ] **Step 2: Make the script executable**
+- [ ] **Step 2: Install boto3 if needed**
 
-Run: `chmod +x milvus/scripts/test-vectorbucket.sh`
+Run: `.runtime/venv-boto3/bin/pip install boto3`
 Expected: exit status 0
 
 - [ ] **Step 3: Add the smoke test invocation to the README**
 
 ```markdown
-## End-to-end smoke test
+## End-to-end boto3 smoke test
 
 ```bash
-./milvus/scripts/test-vectorbucket.sh http://127.0.0.1:9000
+.runtime/venv-boto3/bin/python scripts/test-vectorbucket-boto3.py
 ```
 ```
 
 - [ ] **Step 4: Run the smoke test**
 
-Run: `./milvus/scripts/test-vectorbucket.sh http://127.0.0.1:9000`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-boto3.py`
 Expected: all requests return 2xx JSON responses and `QueryVectors` returns at least one vector
 
 ---
@@ -439,9 +437,9 @@ Expected: PASS
 Run: `cd .worktrees/juicedata-minio && GOWORK=off go test -mod=mod -count=1 -vet=off ./cmd -run 'Test(CreateVectorBucket|PutVectors|QueryVectors)Handler'`
 Expected: PASS
 
-- [ ] **Step 3: Re-run the standalone smoke test**
+- [ ] **Step 3: Re-run the standalone boto3 smoke test**
 
-Run: `./milvus/scripts/test-vectorbucket.sh http://127.0.0.1:9000`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-boto3.py`
 Expected: PASS
 
 - [ ] **Step 4: Commit the deployment artifacts**
@@ -452,8 +450,8 @@ git add \
   milvus/deploy/standalone/milvus.yaml \
   milvus/deploy/standalone/.env.example \
   milvus/deploy/standalone/README.md \
-  milvus/scripts/test-vectorbucket.sh \
-  milvus/docs/superpowers/plans/2026-04-16-juicefs-milvus-standalone-deployment.md
+  scripts/test-vectorbucket-boto3.py \
+  docs/superpowers/plans/2026-04-16-juicefs-milvus-standalone-deployment.md
 
 git commit -m "docs: add executable standalone deployment plan for juicefs to milvus"
 ```
@@ -465,4 +463,3 @@ git commit -m "docs: add executable standalone deployment plan for juicefs to mi
 - Spec coverage: 覆盖了 JuiceFS runtime、Milvus Standalone、JuiceFS bucket 作为 Milvus object storage、`milvus_integration` 构建恢复、以及端到端验证。
 - Placeholder scan: 没有使用 TBD/TODO；每个任务都包含了文件、命令和预期结果。
 - Type consistency: 计划中的接口名和路径与当前分支里的 `VectorBucket`、`milvus_integration`、`CreateVectorBucket/CreateIndex/PutVectors/QueryVectors` 命名一致。
-

@@ -9,7 +9,15 @@ import (
 )
 
 func PhysicalCollectionName(bucketID, collectionID string) string {
-	return fmt.Sprintf("vb_%s_%s", sanitizeCollectionToken(bucketID), sanitizeCollectionToken(collectionID))
+	return PhysicalCollectionNameForTier("standard", bucketID, collectionID)
+}
+
+func PhysicalCollectionNameForTier(tier, bucketID, collectionID string) string {
+	prefix := "vb"
+	if tier == "performance" {
+		prefix = "vbh"
+	}
+	return fmt.Sprintf("%s_%s_%s", prefix, sanitizeCollectionToken(bucketID), sanitizeCollectionToken(collectionID))
 }
 
 func sanitizeCollectionToken(token string) string {

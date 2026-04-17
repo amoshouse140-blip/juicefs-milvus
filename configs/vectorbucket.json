@@ -1,0 +1,8 @@
+{
+  "bucketIndexPolicies": {},
+  "performanceBudgetMB": 3072,
+  "performanceMaxVectors": 200000,
+  "hnswM": 16,
+  "hnswEfConstruction": 200,
+  "diskannSearchList": 100
+}

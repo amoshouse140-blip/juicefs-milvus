@@ -18,11 +18,12 @@ import (
 
 type integrationAdapter struct {
 	collections map[string]struct{}
+	records     map[string][]adapter.VectorRecord
 	search      []adapter.SearchResult
 }
 
 func newIntegrationAdapter() *integrationAdapter {
-	return &integrationAdapter{collections: make(map[string]struct{})}
+	return &integrationAdapter{collections: make(map[string]struct{}), records: make(map[string][]adapter.VectorRecord)}
 }
 
 func (a *integrationAdapter) CreateCollection(ctx context.Context, name string, dim int, metric string) error {
@@ -40,7 +41,7 @@ func (a *integrationAdapter) HasCollection(ctx context.Context, name string) (bo
 	return ok, nil
 }
 
-func (a *integrationAdapter) CreateIndex(ctx context.Context, name string, vectorCount int64, metric string) error {
+func (a *integrationAdapter) CreateIndex(ctx context.Context, name string, spec adapter.IndexSpec) error {
 	return nil
 }
 
@@ -57,6 +58,14 @@ func (a *integrationAdapter) Insert(ctx context.Context, name string, ids []stri
 }
 
 func (a *integrationAdapter) Upsert(ctx context.Context, name string, ids []string, vectors [][]float32, metadataJSON [][]byte, timestamps []int64) error {
+	for i := range ids {
+		a.records[name] = append(a.records[name], adapter.VectorRecord{
+			ID:        ids[i],
+			Vector:    append([]float32(nil), vectors[i]...),
+			Metadata:  append([]byte(nil), metadataJSON[i]...),
+			CreatedAt: timestamps[i],
+		})
+	}
 	return nil
 }
 
@@ -64,8 +73,30 @@ func (a *integrationAdapter) Delete(ctx context.Context, name string, ids []stri
 	return nil
 }
 
-func (a *integrationAdapter) Search(ctx context.Context, name string, vector []float32, topK int, nprobe int, filter string, metric string) ([]adapter.SearchResult, error) {
+func (a *integrationAdapter) Search(ctx context.Context, name string, vector []float32, spec adapter.SearchSpec) ([]adapter.SearchResult, error) {
 	return a.search, nil
+}
+
+func (a *integrationAdapter) Scan(ctx context.Context, name string, batchSize int, fn func([]adapter.VectorRecord) error) error {
+	rows := a.records[name]
+	if batchSize <= 0 {
+		batchSize = len(rows)
+	}
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := append([]adapter.VectorRecord(nil), rows[start:end]...)
+		if err := fn(batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *integrationAdapter) Count(ctx context.Context, name string) (int64, error) {
+	return int64(len(a.records[name])), nil
 }
 
 func (a *integrationAdapter) Close() error {

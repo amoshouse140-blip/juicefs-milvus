@@ -12,6 +12,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metrics"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/quota"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
 )
@@ -55,14 +56,30 @@ func (s *ObjectService) CreateIndex(ctx context.Context, req *CreateIndexRequest
 
 	indexID := uuid.NewString()
 	now := time.Now().UTC()
+	policy := s.cfg.PolicyForBucket(bucketName)
+	indexType := policy.IndexType
+	tier := s.cfg.TierForIndexType(indexType)
+	maxVectors := int64(0)
+	pinned := false
+	if s.cfg.IsPinnedIndexType(indexType) {
+		maxVectors = policy.MaxVectors
+		if err := s.quota.CanCreatePerformanceCollection(ctx, maxVectors, req.Dimension); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
+		}
+		pinned = true
+	}
 	coll := &metadata.LogicalCollection{
 		ID:           indexID,
 		BucketID:     bucket.ID,
 		Name:         req.IndexName,
 		Dim:          req.Dimension,
 		Metric:       metric,
+		IndexType:    indexType,
+		Tier:         tier,
+		MaxVectors:   maxVectors,
+		Pinned:       pinned,
 		Status:       metadata.CollStatusInit,
-		PhysicalName: router.PhysicalCollectionName(bucket.ID, indexID),
+		PhysicalName: router.PhysicalCollectionNameForTier(tier, bucket.ID, indexID),
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -73,7 +90,14 @@ func (s *ObjectService) CreateIndex(ctx context.Context, req *CreateIndexRequest
 		_ = s.store.DeleteCollection(ctx, coll.ID)
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
-	if err := s.adapter.CreateIndex(ctx, coll.PhysicalName, coll.VectorCount, coll.Metric); err != nil {
+	if err := s.adapter.CreateIndex(ctx, coll.PhysicalName, adapter.IndexSpec{
+		IndexType:          coll.IndexType,
+		Tier:               coll.Tier,
+		VectorCount:        coll.VectorCount,
+		Metric:             coll.Metric,
+		HNSWM:              policy.HNSWM,
+		HNSWEFConstruction: policy.HNSWEFConstruction,
+	}); err != nil {
 		_ = s.adapter.DropCollection(ctx, coll.PhysicalName)
 		_ = s.store.DeleteCollection(ctx, coll.ID)
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
@@ -85,6 +109,19 @@ func (s *ObjectService) CreateIndex(ctx context.Context, req *CreateIndexRequest
 	if err := s.store.UpdateCollectionStatus(ctx, coll.ID, metadata.CollStatusReady); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
+	if coll.Pinned {
+		started := time.Now()
+		estMem := controller.EstimateMemMB(coll.MaxVectors, coll.Dim)
+		if err := s.controller.EnsureLoaded(ctx, coll.PhysicalName, estMem); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+		}
+		s.controller.Pin(coll.PhysicalName)
+		metrics.LoadDuration.WithLabelValues(coll.Tier).Observe(time.Since(started).Seconds())
+		metrics.LoadedCollectionCount.WithLabelValues(coll.Tier).Inc()
+		metrics.CollectionMemEstimate.WithLabelValues(coll.PhysicalName, coll.Tier).Set(estMem)
+	}
+	metrics.LogicalCollectionCount.WithLabelValues(string(metadata.CollStatusReady), coll.Tier).Inc()
+	metrics.IndexCreateTotal.WithLabelValues(coll.Tier).Inc()
 	return &CreateIndexResponse{
 		IndexARN: formatIndexARN(req.Region, req.AccountID, bucketName, req.IndexName),
 	}, nil
@@ -100,6 +137,10 @@ func (s *ObjectService) DeleteIndex(ctx context.Context, req *DeleteIndexRequest
 		return fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
 	_ = s.store.UpdateCollectionStatus(ctx, coll.ID, metadata.CollStatusDeleting)
+	if coll.Pinned {
+		s.controller.Unpin(coll.PhysicalName)
+		metrics.LoadedCollectionCount.WithLabelValues(coll.Tier).Dec()
+	}
 	_ = s.adapter.ReleaseCollection(ctx, coll.PhysicalName)
 	if err := s.adapter.DropCollection(ctx, coll.PhysicalName); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
@@ -107,7 +148,48 @@ func (s *ObjectService) DeleteIndex(ctx context.Context, req *DeleteIndexRequest
 	if err := s.store.DeleteCollection(ctx, coll.ID); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
 	}
+	metrics.LogicalCollectionCount.WithLabelValues(string(metadata.CollStatusReady), coll.Tier).Dec()
+	metrics.CollectionMemEstimate.DeleteLabelValues(coll.PhysicalName, coll.Tier)
+	metrics.IndexDeleteTotal.WithLabelValues(coll.Tier).Inc()
 	return nil
+}
+
+func (s *ObjectService) ChangeIndexModel(ctx context.Context, req *ChangeIndexModelRequest) (*ChangeIndexModelResponse, error) {
+	bucketName, indexName, err := req.Target.ResolveNames()
+	if err != nil {
+		return nil, err
+	}
+	coll, err := s.router.Resolve(ctx, bucketName, indexName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	if coll.MigrateState != "" {
+		return nil, fmt.Errorf("%w: collection is already migrating", ErrConflict)
+	}
+
+	indexType := normalizeIndexType(req.IndexModel)
+	if indexType == "" {
+		return nil, fmt.Errorf("%w: unsupported index model %q", ErrValidation, req.IndexModel)
+	}
+	if indexType == coll.IndexType {
+		return nil, fmt.Errorf("%w: index model is already %s", ErrConflict, indexType)
+	}
+
+	bucket, err := s.store.GetBucketByName(ctx, bucketName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	targetTier := s.cfg.TierForIndexType(indexType)
+	targetPhysical := router.PhysicalCollectionNameForTier(targetTier, bucket.ID, fmt.Sprintf("%s_mig_%s", coll.ID, uuid.NewString()))
+	if err := s.store.UpdateCollectionMigrationState(ctx, coll.ID, "UPGRADING", indexType, coll.PhysicalName, targetPhysical, time.Now().UTC(), ""); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+
+	return &ChangeIndexModelResponse{
+		IndexARN:   formatIndexARN(req.Region, req.AccountID, bucketName, indexName),
+		IndexModel: indexType,
+		State:      "UPGRADING",
+	}, nil
 }
 
 func (s *ObjectService) PutVectors(ctx context.Context, req *PutVectorsRequest) error {
@@ -119,8 +201,16 @@ func (s *ObjectService) PutVectors(ctx context.Context, req *PutVectorsRequest) 
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
+	if coll.MigrateState != "" {
+		return fmt.Errorf("%w: collection is migrating", ErrServiceUnavailable)
+	}
 	if err := s.quota.CheckVectorCount(coll.VectorCount, len(req.Vectors)); err != nil {
 		return fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
+	}
+	if s.cfg.IsPinnedIndexType(coll.IndexType) {
+		if err := s.quota.CheckPerformanceVectorLimit(coll.VectorCount, len(req.Vectors), coll.MaxVectors); err != nil {
+			return fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
+		}
 	}
 
 	ids := make([]string, 0, len(req.Vectors))
@@ -143,6 +233,20 @@ func (s *ObjectService) PutVectors(ctx context.Context, req *PutVectorsRequest) 
 	if err := s.store.UpdateCollectionVectorCount(ctx, coll.ID, int64(len(req.Vectors))); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
 	}
+	if coll.Pinned {
+		estMem := coll.EstMemMB
+		if estMem <= 0 {
+			estMem = controller.EstimateMemMB(coll.MaxVectors, coll.Dim)
+		}
+		if err := s.controller.Release(ctx, coll.PhysicalName); err != nil {
+			return fmt.Errorf("%w: %v", ErrInternal, err)
+		}
+		if err := s.controller.EnsureLoaded(ctx, coll.PhysicalName, estMem); err != nil {
+			return fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+		}
+		s.controller.Pin(coll.PhysicalName)
+	}
+	metrics.InsertTotal.WithLabelValues(bucketName, indexName, coll.Tier).Add(float64(len(req.Vectors)))
 	return nil
 }
 
@@ -154,6 +258,9 @@ func (s *ObjectService) DeleteVectors(ctx context.Context, req *DeleteVectorsReq
 	coll, err := s.router.Resolve(ctx, bucketName, indexName)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	if coll.MigrateState != "" {
+		return fmt.Errorf("%w: collection is migrating", ErrServiceUnavailable)
 	}
 	if err := s.adapter.Delete(ctx, coll.PhysicalName, req.Keys); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
@@ -170,5 +277,18 @@ func normalizeMetric(metric string) string {
 		return "L2"
 	default:
 		return "COSINE"
+	}
+}
+
+func normalizeIndexType(indexType string) string {
+	switch strings.ToLower(strings.TrimSpace(indexType)) {
+	case "ivf_sq8":
+		return "ivf_sq8"
+	case "hnsw":
+		return "hnsw"
+	case "diskann":
+		return "diskann"
+	default:
+		return ""
 	}
 }

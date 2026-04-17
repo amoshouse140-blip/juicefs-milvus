@@ -34,12 +34,23 @@ type LogicalCollection struct {
 	Name         string
 	Dim          int
 	Metric       string
+	IndexType    string
+	Tier         string
+	MaxVectors   int64
+	Pinned       bool
 	Status       CollectionStatus
 	PhysicalName string
 	IndexBuilt   bool
 	VectorCount  int64
 	EstMemMB     float64
 	LastAccessAt time.Time
+	MigrateState string
+
+	TargetIndexType    string
+	SourcePhysicalName string
+	TargetPhysicalName string
+	MaintenanceSince   time.Time
+	LastMigrateError   string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }

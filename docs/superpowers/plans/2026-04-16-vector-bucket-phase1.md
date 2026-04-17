@@ -2,7 +2,7 @@
 
 > **给 Agent 执行者:** 必须使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务执行本计划。步骤使用 `- [ ]` 语法追踪进度。
 
-> **实现位置修正:** Phase 1 应落在 **JuiceFS** 的 S3 Gateway 上实现，而不是在 Milvus 仓库里新增一个独立的 Gin/HTTP 服务。本文档保留在 `milvus/docs/`，仅作为 JuiceFS + Milvus 联动设计与任务拆解。
+> **实现位置修正:** Phase 1 应落在 **JuiceFS** 的 S3 Gateway 上实现，而不是在 Milvus 仓库里新增一个独立的 Gin/HTTP 服务。本文档迁到仓库根 `docs/`，作为 JuiceFS + Milvus 联动设计与任务拆解。
 
 **目标:** 在 JuiceFS 的 S3 Gateway 上提供 Vector Bucket 能力，对外兼容 AWS S3 Vector Bucket API；JuiceFS 负责协议入口、bucket 生命周期、鉴权与请求编排，Milvus Standalone（IVF_SQ8+mmap）负责底层向量写入、索引和检索，同时补齐 LRU/TTL Load/Release 控制器、配额管控和监控指标。
 

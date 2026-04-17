@@ -18,6 +18,7 @@ type LoadEntry struct {
 	LastAccessAt  time.Time
 	EstMemMB      float64
 	InFlightCount int64
+	Pinned        bool
 }
 
 type LoadController struct {
@@ -68,6 +69,46 @@ func (c *LoadController) Touch(name string) {
 		entry.LastAccessAt = time.Now()
 		c.moveLRUToBack(name)
 	}
+}
+
+func (c *LoadController) Pin(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[name]; ok {
+		entry.Pinned = true
+	}
+}
+
+func (c *LoadController) Unpin(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[name]; ok {
+		entry.Pinned = false
+	}
+}
+
+func (c *LoadController) IsPinned(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[name]
+	return ok && entry.Pinned
+}
+
+func (c *LoadController) Release(ctx context.Context, name string) error {
+	c.mu.Lock()
+	_, ok := c.entries[name]
+	c.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	if err := c.adapter.ReleaseCollection(ctx, name); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.entries, name)
+	c.removeLRU(name)
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *LoadController) InFlightInc(name string) {
@@ -135,6 +176,9 @@ func (c *LoadController) RunTTLSweep() {
 	now := time.Now()
 	var toRelease []string
 	for name, entry := range c.entries {
+		if entry.Pinned {
+			continue
+		}
 		if now.Sub(entry.LastAccessAt) > c.ttl && entry.InFlightCount == 0 {
 			toRelease = append(toRelease, name)
 		}
@@ -180,7 +224,7 @@ func (c *LoadController) evictIfNeededLocked(neededMB float64) error {
 		evicted := false
 		for _, candidate := range c.lruOrder {
 			entry := c.entries[candidate]
-			if entry == nil || entry.InFlightCount > 0 {
+			if entry == nil || entry.Pinned || entry.InFlightCount > 0 {
 				continue
 			}
 			if err := c.adapter.ReleaseCollection(context.Background(), candidate); err != nil {

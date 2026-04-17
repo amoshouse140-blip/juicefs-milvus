@@ -34,7 +34,7 @@ func NewRuntime(cfg config.Config, store metadata.Store, milvus adapter.Adapter,
 	}
 	r.buckets = NewBucketService(store, r.quota)
 	r.objects = NewObjectService(store, r.router, milvus, ctrl, r.quota, cfg)
-	r.query = NewQueryService(store, r.router, milvus, ctrl)
+	r.query = NewQueryService(store, r.router, milvus, ctrl, cfg)
 	return r
 }
 
@@ -67,6 +67,10 @@ func (r *Runtime) CreateIndex(ctx context.Context, req *CreateIndexRequest) (*Cr
 
 func (r *Runtime) DeleteIndex(ctx context.Context, req *DeleteIndexRequest) error {
 	return r.objects.DeleteIndex(ctx, req)
+}
+
+func (r *Runtime) ChangeIndexModel(ctx context.Context, req *ChangeIndexModelRequest) (*ChangeIndexModelResponse, error) {
+	return r.objects.ChangeIndexModel(ctx, req)
 }
 
 func (r *Runtime) PutVectors(ctx context.Context, req *PutVectorsRequest) error {

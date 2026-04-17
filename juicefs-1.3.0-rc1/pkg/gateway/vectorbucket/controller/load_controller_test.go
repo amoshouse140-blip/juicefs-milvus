@@ -127,3 +127,44 @@ func TestTouchUpdatesLRU(t *testing.T) {
 	assert.True(t, ctrl.IsLoaded("coll1"))
 	assert.False(t, ctrl.IsLoaded("coll2"))
 }
+
+func TestPinnedCollectionSkipsTTLSweep(t *testing.T) {
+	ma := newMockAdapter()
+	ctrl := NewLoadController(ma, 4096, 100*time.Millisecond, 50)
+
+	require.NoError(t, ctrl.EnsureLoaded(context.Background(), "coll1", 100.0))
+	ctrl.Pin("coll1")
+	assert.True(t, ctrl.IsPinned("coll1"))
+
+	time.Sleep(200 * time.Millisecond)
+	ctrl.RunTTLSweep()
+
+	assert.True(t, ctrl.IsLoaded("coll1"))
+}
+
+func TestPinnedCollectionSkipsLRUEviction(t *testing.T) {
+	ma := newMockAdapter()
+	ctrl := NewLoadController(ma, 200, 30*time.Minute, 50)
+
+	require.NoError(t, ctrl.EnsureLoaded(context.Background(), "coll1", 100.0))
+	ctrl.Pin("coll1")
+	require.NoError(t, ctrl.EnsureLoaded(context.Background(), "coll2", 100.0))
+	require.NoError(t, ctrl.EnsureLoaded(context.Background(), "coll3", 100.0))
+
+	assert.True(t, ctrl.IsLoaded("coll1"))
+	assert.False(t, ctrl.IsLoaded("coll2"))
+	assert.True(t, ctrl.IsLoaded("coll3"))
+}
+
+func TestReleaseRemovesLoadedEntry(t *testing.T) {
+	ma := newMockAdapter()
+	ctrl := NewLoadController(ma, 4096, 30*time.Minute, 50)
+
+	require.NoError(t, ctrl.EnsureLoaded(context.Background(), "coll1", 100.0))
+	ctrl.Pin("coll1")
+	require.NoError(t, ctrl.Release(context.Background(), "coll1"))
+
+	assert.False(t, ctrl.IsLoaded("coll1"))
+	assert.False(t, ctrl.IsPinned("coll1"))
+	assert.False(t, ma.isLoaded("coll1"))
+}

@@ -190,6 +190,26 @@ func (api objectAPIHandlers) DeleteIndexHandler(w http.ResponseWriter, r *http.R
 	writeVectorSuccess(w, nil)
 }
 
+func (api objectAPIHandlers) ChangeIndexModelHandler(w http.ResponseWriter, r *http.Request) {
+	ext := api.vectorAPI()
+	if ext == nil {
+		writeVectorError(w, VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented})
+		return
+	}
+	var req ChangeIndexModelRequest
+	if err := decodeVectorRequest(r, &req); err != nil {
+		writeVectorError(w, VectorAPIError{Code: "ValidationException", Message: err.Error(), Status: http.StatusBadRequest})
+		return
+	}
+	req.RequestContext = vectorRequestContext(r)
+	resp, err := ext.ChangeIndexModel(r.Context(), &req)
+	if err != nil {
+		writeVectorError(w, err)
+		return
+	}
+	writeVectorSuccess(w, resp)
+}
+
 func (api objectAPIHandlers) PutVectorsHandler(w http.ResponseWriter, r *http.Request) {
 	ext := api.vectorAPI()
 	if ext == nil {

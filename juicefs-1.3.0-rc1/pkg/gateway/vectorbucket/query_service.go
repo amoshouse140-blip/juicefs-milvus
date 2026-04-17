@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/adapter"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/config"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/controller"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metadata"
+	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/metrics"
 	"github.com/juicedata/juicefs/pkg/gateway/vectorbucket/router"
 )
 
@@ -16,10 +19,11 @@ type QueryService struct {
 	router     *router.NamespaceRouter
 	adapter    adapter.Adapter
 	controller *controller.LoadController
+	cfg        config.Config
 }
 
-func NewQueryService(store metadata.Store, ns *router.NamespaceRouter, milvus adapter.Adapter, ctrl *controller.LoadController) *QueryService {
-	return &QueryService{store: store, router: ns, adapter: milvus, controller: ctrl}
+func NewQueryService(store metadata.Store, ns *router.NamespaceRouter, milvus adapter.Adapter, ctrl *controller.LoadController, cfg config.Config) *QueryService {
+	return &QueryService{store: store, router: ns, adapter: milvus, controller: ctrl, cfg: cfg}
 }
 
 func (s *QueryService) QueryVectors(ctx context.Context, req *QueryVectorsRequest) (*QueryVectorsResponse, error) {
@@ -39,19 +43,34 @@ func (s *QueryService) QueryVectors(ctx context.Context, req *QueryVectorsReques
 	if estMem <= 0 {
 		estMem = controller.EstimateMemMB(coll.VectorCount, coll.Dim)
 	}
+	loadStarted := time.Now()
 	if err := s.controller.EnsureLoaded(ctx, coll.PhysicalName, estMem); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
 	}
+	metrics.LoadDuration.WithLabelValues(coll.Tier).Observe(time.Since(loadStarted).Seconds())
 	s.controller.InFlightInc(coll.PhysicalName)
 	defer s.controller.InFlightDec(coll.PhysicalName)
 	s.controller.Touch(coll.PhysicalName)
 	_ = s.store.UpdateCollectionLastAccess(ctx, coll.ID)
 
 	filter := strings.TrimSpace(string(req.Filter))
-	results, err := s.adapter.Search(ctx, coll.PhysicalName, req.QueryVector.Float32, req.TopK, 16, filter, coll.Metric)
+	policy := s.cfg.PolicyForBucket(bucketName)
+	searchStarted := time.Now()
+	results, err := s.adapter.Search(ctx, coll.PhysicalName, req.QueryVector.Float32, adapter.SearchSpec{
+		IndexType:         coll.IndexType,
+		Tier:              coll.Tier,
+		Metric:            coll.Metric,
+		NProbe:            16,
+		HNSWEF:            policy.HNSWEFConstruction,
+		DiskANNSearchList: policy.DiskANNSearchList,
+		Filter:            filter,
+		TopK:              req.TopK,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
+	metrics.QueryDuration.WithLabelValues("search", coll.Tier).Observe(time.Since(searchStarted).Seconds())
+	metrics.QueryTotal.WithLabelValues(bucketName, indexName, coll.Tier).Inc()
 	resp := &QueryVectorsResponse{
 		DistanceMetric: strings.ToLower(coll.Metric),
 		Vectors:        make([]QueryResultVector, 0, len(results)),

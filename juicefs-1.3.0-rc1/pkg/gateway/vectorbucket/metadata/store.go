@@ -1,6 +1,9 @@
 package metadata
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type Store interface {
 	CreateBucket(ctx context.Context, b *Bucket) error
@@ -20,6 +23,9 @@ type Store interface {
 	UpdateCollectionIndexBuilt(ctx context.Context, id string, built bool) error
 	UpdateCollectionVectorCount(ctx context.Context, id string, delta int64) error
 	UpdateCollectionLastAccess(ctx context.Context, id string) error
+	UpdateCollectionMigrationState(ctx context.Context, id string, state string, targetIndexType string, sourcePhysical string, targetPhysical string, maintenanceSince time.Time, lastErr string) error
+	SwitchCollectionPhysical(ctx context.Context, id string, oldPhysical string, newPhysical string, newIndexType string, newTier string, newPinned bool, newMaxVectors int64) error
+	ListCollectionsInMigration(ctx context.Context) ([]*LogicalCollection, error)
 	DeleteCollection(ctx context.Context, id string) error
 	CountCollections(ctx context.Context, bucketID string) (int, error)
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -41,12 +42,22 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 		name           TEXT NOT NULL,
 		dim            INTEGER NOT NULL,
 		metric         TEXT NOT NULL,
+		index_type     TEXT NOT NULL DEFAULT 'ivf_sq8',
+		tier           TEXT NOT NULL DEFAULT 'standard',
+		max_vectors    INTEGER NOT NULL DEFAULT 0,
+		pinned         BOOLEAN NOT NULL DEFAULT FALSE,
 		status         TEXT NOT NULL DEFAULT 'INIT',
 		physical_name  TEXT NOT NULL,
 		index_built    BOOLEAN NOT NULL DEFAULT FALSE,
 		vector_count   INTEGER NOT NULL DEFAULT 0,
 		est_mem_mb     REAL NOT NULL DEFAULT 0,
 		last_access_at DATETIME,
+		migrate_state TEXT NOT NULL DEFAULT '',
+		target_index_type TEXT NOT NULL DEFAULT '',
+		source_physical_name TEXT NOT NULL DEFAULT '',
+		target_physical_name TEXT NOT NULL DEFAULT '',
+		maintenance_since DATETIME,
+		last_migrate_error TEXT NOT NULL DEFAULT '',
 		created_at     DATETIME NOT NULL,
 		updated_at     DATETIME NOT NULL,
 		UNIQUE(bucket_id, name)
@@ -56,6 +67,25 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 		_ = s.db.Close()
 		s.db = nil
 		return fmt.Errorf("create schema: %w", err)
+	}
+	migrations := []string{
+		"ALTER TABLE collections ADD COLUMN index_type TEXT NOT NULL DEFAULT 'ivf_sq8'",
+		"ALTER TABLE collections ADD COLUMN tier TEXT NOT NULL DEFAULT 'standard'",
+		"ALTER TABLE collections ADD COLUMN max_vectors INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE collections ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE",
+		"ALTER TABLE collections ADD COLUMN migrate_state TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE collections ADD COLUMN target_index_type TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE collections ADD COLUMN source_physical_name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE collections ADD COLUMN target_physical_name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE collections ADD COLUMN maintenance_since DATETIME",
+		"ALTER TABLE collections ADD COLUMN last_migrate_error TEXT NOT NULL DEFAULT ''",
+	}
+	for _, stmt := range migrations {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			_ = s.db.Close()
+			s.db = nil
+			return fmt.Errorf("migrate schema: %w", err)
+		}
 	}
 	return nil
 }
@@ -163,20 +193,24 @@ func (s *SQLiteStore) CreateCollection(ctx context.Context, c *LogicalCollection
 	if !c.LastAccessAt.IsZero() {
 		lastAccess = c.LastAccessAt
 	}
+	var maintenanceSince any
+	if !c.MaintenanceSince.IsZero() {
+		maintenanceSince = c.MaintenanceSince
+	}
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO collections
-			(id, bucket_id, name, dim, metric, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.BucketID, c.Name, c.Dim, c.Metric, c.Status, c.PhysicalName,
-		c.IndexBuilt, c.VectorCount, c.EstMemMB, lastAccess, createdAt, updatedAt,
+			(id, bucket_id, name, dim, metric, index_type, tier, max_vectors, pinned, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, migrate_state, target_index_type, source_physical_name, target_physical_name, maintenance_since, last_migrate_error, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.BucketID, c.Name, c.Dim, c.Metric, c.IndexType, c.Tier, c.MaxVectors, c.Pinned, c.Status, c.PhysicalName,
+		c.IndexBuilt, c.VectorCount, c.EstMemMB, lastAccess, c.MigrateState, c.TargetIndexType, c.SourcePhysicalName, c.TargetPhysicalName, maintenanceSince, c.LastMigrateError, createdAt, updatedAt,
 	)
 	return err
 }
 
 func (s *SQLiteStore) GetCollection(ctx context.Context, bucketID, name string) (*LogicalCollection, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, bucket_id, name, dim, metric, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, created_at, updated_at
+		`SELECT id, bucket_id, name, dim, metric, index_type, tier, max_vectors, pinned, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, migrate_state, target_index_type, source_physical_name, target_physical_name, maintenance_since, last_migrate_error, created_at, updated_at
 		 FROM collections
 		 WHERE bucket_id = ? AND name = ? AND status != 'DELETED'`,
 		bucketID, name,
@@ -186,7 +220,7 @@ func (s *SQLiteStore) GetCollection(ctx context.Context, bucketID, name string) 
 
 func (s *SQLiteStore) GetCollectionByID(ctx context.Context, id string) (*LogicalCollection, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, bucket_id, name, dim, metric, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, created_at, updated_at
+		`SELECT id, bucket_id, name, dim, metric, index_type, tier, max_vectors, pinned, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, migrate_state, target_index_type, source_physical_name, target_physical_name, maintenance_since, last_migrate_error, created_at, updated_at
 		 FROM collections
 		 WHERE id = ?`,
 		id,
@@ -196,7 +230,7 @@ func (s *SQLiteStore) GetCollectionByID(ctx context.Context, id string) (*Logica
 
 func (s *SQLiteStore) ListCollections(ctx context.Context, bucketID string) ([]*LogicalCollection, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, bucket_id, name, dim, metric, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, created_at, updated_at
+		`SELECT id, bucket_id, name, dim, metric, index_type, tier, max_vectors, pinned, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, migrate_state, target_index_type, source_physical_name, target_physical_name, maintenance_since, last_migrate_error, created_at, updated_at
 		 FROM collections
 		 WHERE bucket_id = ? AND status != 'DELETED'
 		 ORDER BY created_at, id`,
@@ -251,6 +285,66 @@ func (s *SQLiteStore) UpdateCollectionLastAccess(ctx context.Context, id string)
 	return err
 }
 
+func (s *SQLiteStore) UpdateCollectionMigrationState(ctx context.Context, id string, state string, targetIndexType string, sourcePhysical string, targetPhysical string, maintenanceSince time.Time, lastErr string) error {
+	now := time.Now().UTC()
+	var maintenance any
+	if !maintenanceSince.IsZero() {
+		maintenance = maintenanceSince
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE collections
+		 SET migrate_state = ?, target_index_type = ?, source_physical_name = ?, target_physical_name = ?, maintenance_since = ?, last_migrate_error = ?, updated_at = ?
+		 WHERE id = ?`,
+		state, targetIndexType, sourcePhysical, targetPhysical, maintenance, lastErr, now, id,
+	)
+	return err
+}
+
+func (s *SQLiteStore) SwitchCollectionPhysical(ctx context.Context, id string, oldPhysical string, newPhysical string, newIndexType string, newTier string, newPinned bool, newMaxVectors int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE collections
+		 SET physical_name = ?, index_type = ?, tier = ?, pinned = ?, max_vectors = ?,
+		     migrate_state = '', target_index_type = '', source_physical_name = '', target_physical_name = '',
+		     maintenance_since = NULL, last_migrate_error = '', updated_at = ?
+		 WHERE id = ? AND physical_name = ?`,
+		newPhysical, newIndexType, newTier, newPinned, newMaxVectors, time.Now().UTC(), id, oldPhysical,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListCollectionsInMigration(ctx context.Context) ([]*LogicalCollection, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, bucket_id, name, dim, metric, index_type, tier, max_vectors, pinned, status, physical_name, index_built, vector_count, est_mem_mb, last_access_at, migrate_state, target_index_type, source_physical_name, target_physical_name, maintenance_since, last_migrate_error, created_at, updated_at
+		 FROM collections
+		 WHERE migrate_state != ''
+		 ORDER BY updated_at, id`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*LogicalCollection
+	for rows.Next() {
+		c, err := scanCollectionRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLiteStore) DeleteCollection(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM collections WHERE id = ?", id)
 	return err
@@ -284,18 +378,29 @@ type rowScanner interface {
 func scanCollectionRow(row rowScanner) (*LogicalCollection, error) {
 	c := &LogicalCollection{}
 	var lastAccess sql.NullTime
+	var maintenanceSince sql.NullTime
 	if err := row.Scan(
 		&c.ID,
 		&c.BucketID,
 		&c.Name,
 		&c.Dim,
 		&c.Metric,
+		&c.IndexType,
+		&c.Tier,
+		&c.MaxVectors,
+		&c.Pinned,
 		&c.Status,
 		&c.PhysicalName,
 		&c.IndexBuilt,
 		&c.VectorCount,
 		&c.EstMemMB,
 		&lastAccess,
+		&c.MigrateState,
+		&c.TargetIndexType,
+		&c.SourcePhysicalName,
+		&c.TargetPhysicalName,
+		&maintenanceSince,
+		&c.LastMigrateError,
 		&c.CreatedAt,
 		&c.UpdatedAt,
 	); err != nil {
@@ -303,6 +408,9 @@ func scanCollectionRow(row rowScanner) (*LogicalCollection, error) {
 	}
 	if lastAccess.Valid {
 		c.LastAccessAt = lastAccess.Time
+	}
+	if maintenanceSince.Valid {
+		c.MaintenanceSince = maintenanceSince.Time
 	}
 	return c, nil
 }

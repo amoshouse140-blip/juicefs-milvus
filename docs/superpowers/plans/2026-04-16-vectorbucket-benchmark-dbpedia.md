@@ -4,7 +4,7 @@
 
 **Goal:** 增加一套基于官方 `boto3 s3vectors` client 的 Vector Bucket 规模与性能测试脚本，使用开源 `DBpedia OpenAI 1M` embedding 数据集，支持 `10K / 100K / 1M` 三档压测。
 
-**Architecture:** 基准脚本运行在仓库外层 `milvus/scripts/`，只通过 `boto3.client("s3vectors")` 调用本地 JuiceFS gateway，不直接依赖 bridge 或 Milvus 私有 API。数据集下载与切片逻辑单独封装到数据加载模块，benchmark runner 负责创建 bucket/index、批量写入、并发查询、可选删除验证，并将结果写到 `.runtime/benchmarks/` JSON 报告中。
+**Architecture:** 基准脚本运行在仓库外层 `scripts/`，只通过 `boto3.client("s3vectors")` 调用本地 JuiceFS gateway，不直接依赖 bridge 或 Milvus 私有 API。数据集下载与切片逻辑单独封装到数据加载模块，benchmark runner 负责创建 bucket/index、批量写入、并发查询、可选删除验证，并将结果写到 `.runtime/benchmarks/` JSON 报告中。
 
 **Tech Stack:** Python 3, boto3 `s3vectors`, botocore, Hugging Face `datasets`, Parquet, JuiceFS S3 Gateway, Milvus bridge
 
@@ -14,12 +14,12 @@
 
 ### 计划涉及的文件
 
-- Create: `milvus/scripts/test-vectorbucket-benchmark.py`
-- Create: `milvus/scripts/lib/vectorbucket_benchmark_dataset.py`
-- Create: `milvus/scripts/lib/vectorbucket_benchmark_runner.py`
-- Create: `milvus/scripts/lib/vectorbucket_benchmark_report.py`
-- Create: `milvus/scripts/requirements-benchmark.txt`
-- Modify: `milvus/scripts/test-vectorbucket-boto3.py`
+- Create: `scripts/test-vectorbucket-benchmark.py`
+- Create: `scripts/lib/vectorbucket_benchmark_dataset.py`
+- Create: `scripts/lib/vectorbucket_benchmark_runner.py`
+- Create: `scripts/lib/vectorbucket_benchmark_report.py`
+- Create: `scripts/requirements-benchmark.txt`
+- Modify: `scripts/test-vectorbucket-boto3.py`
 - Modify: `milvus/deploy/standalone/README.md`
 
 ### 运行时目录
@@ -45,7 +45,7 @@
 ### Task 1: Add Benchmark Python Dependencies
 
 **Files:**
-- Create: `milvus/scripts/requirements-benchmark.txt`
+- Create: `scripts/requirements-benchmark.txt`
 
 - [ ] **Step 1: Write the benchmark dependency file**
 
@@ -59,12 +59,12 @@ numpy>=1.26.0
 
 - [ ] **Step 2: Verify the file contents**
 
-Run: `sed -n '1,120p' milvus/scripts/requirements-benchmark.txt`
+Run: `sed -n '1,120p' scripts/requirements-benchmark.txt`
 Expected: shows the five pinned dependency ranges above
 
 - [ ] **Step 3: Install into the existing local venv**
 
-Run: `.runtime/venv-boto3/bin/pip install -r milvus/scripts/requirements-benchmark.txt`
+Run: `.runtime/venv-boto3/bin/pip install -r scripts/requirements-benchmark.txt`
 Expected: pip installs `datasets`, `pyarrow`, and confirms `boto3` remains available
 
 - [ ] **Step 4: Verify imports**
@@ -77,7 +77,7 @@ Expected: prints `ok`
 ### Task 2: Implement Dataset Loader For DBpedia 1M
 
 **Files:**
-- Create: `milvus/scripts/lib/vectorbucket_benchmark_dataset.py`
+- Create: `scripts/lib/vectorbucket_benchmark_dataset.py`
 
 - [ ] **Step 1: Write a failing smoke command for the loader**
 
@@ -157,7 +157,7 @@ Expected: prints `5` and a non-empty row id
 ### Task 3: Implement Benchmark Reporting Utilities
 
 **Files:**
-- Create: `milvus/scripts/lib/vectorbucket_benchmark_report.py`
+- Create: `scripts/lib/vectorbucket_benchmark_report.py`
 
 - [ ] **Step 1: Write a failing import check**
 
@@ -220,7 +220,7 @@ Expected: prints `True`
 ### Task 4: Implement Benchmark Runner
 
 **Files:**
-- Create: `milvus/scripts/lib/vectorbucket_benchmark_runner.py`
+- Create: `scripts/lib/vectorbucket_benchmark_runner.py`
 
 - [ ] **Step 1: Write a failing import check**
 
@@ -378,11 +378,11 @@ Expected: prints `[[1, 2], [3, 4], [5]]`
 ### Task 5: Implement The CLI Benchmark Script
 
 **Files:**
-- Create: `milvus/scripts/test-vectorbucket-benchmark.py`
+- Create: `scripts/test-vectorbucket-benchmark.py`
 
 - [ ] **Step 1: Write a failing invocation**
 
-Run: `.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --help`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --help`
 Expected: FAIL with `No such file or directory`
 
 - [ ] **Step 2: Add CLI parsing and profile mapping**
@@ -482,7 +482,7 @@ def main() -> int:
 
 - [ ] **Step 4: Verify CLI help**
 
-Run: `.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --help`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --help`
 Expected: prints `--profile`, `--batch-size`, `--query-count`, and `--query-workers`
 
 ---
@@ -490,8 +490,8 @@ Expected: prints `--profile`, `--batch-size`, `--query-count`, and `--query-work
 ### Task 6: Add Delete Visibility Check To The Benchmark
 
 **Files:**
-- Modify: `milvus/scripts/lib/vectorbucket_benchmark_runner.py`
-- Modify: `milvus/scripts/test-vectorbucket-benchmark.py`
+- Modify: `scripts/lib/vectorbucket_benchmark_runner.py`
+- Modify: `scripts/test-vectorbucket-benchmark.py`
 
 - [ ] **Step 1: Add delete check helper to the runner**
 
@@ -530,7 +530,7 @@ def verify_delete_visibility(client: Any, cfg: BenchmarkConfig, key: str, vector
 
 - [ ] **Step 3: Verify the delete check result is emitted**
 
-Run: `.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 10k --query-count 20`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 10k --query-count 20`
 Expected: prints a JSON report path; report contains `"delete_check"` and `"visible_after_delete": false`
 
 ---
@@ -539,7 +539,7 @@ Expected: prints a JSON report path; report contains `"delete_check"` and `"visi
 
 **Files:**
 - Modify: `milvus/deploy/standalone/README.md`
-- Modify: `milvus/scripts/test-vectorbucket-boto3.py`
+- Modify: `scripts/test-vectorbucket-boto3.py`
 
 - [ ] **Step 1: Add a benchmark section to the standalone README**
 
@@ -549,15 +549,15 @@ Expected: prints a JSON report path; report contains `"delete_check"` and `"visi
 Install benchmark dependencies:
 
 ```bash
-.runtime/venv-boto3/bin/pip install -r milvus/scripts/requirements-benchmark.txt
+.runtime/venv-boto3/bin/pip install -r scripts/requirements-benchmark.txt
 ```
 
 Run the three supported profiles:
 
 ```bash
-.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 10k
-.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 100k
-.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 1m
+.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 10k
+.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 100k
+.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 1m
 ```
 
 Reports are written to `.runtime/benchmarks/`.
@@ -575,7 +575,7 @@ For scale and performance testing, use test-vectorbucket-benchmark.py.
 
 - [ ] **Step 3: Verify documentation references the benchmark script**
 
-Run: `rg -n 'test-vectorbucket-benchmark.py|requirements-benchmark.txt|.runtime/benchmarks' milvus/deploy/standalone/README.md milvus/scripts/test-vectorbucket-boto3.py`
+Run: `rg -n 'test-vectorbucket-benchmark.py|requirements-benchmark.txt|.runtime/benchmarks' milvus/deploy/standalone/README.md scripts/test-vectorbucket-boto3.py`
 Expected: output shows all three strings
 
 ---
@@ -583,18 +583,18 @@ Expected: output shows all three strings
 ### Task 8: Verify 10K End-To-End Benchmark
 
 **Files:**
-- Test: `milvus/scripts/test-vectorbucket-benchmark.py`
-- Test: `milvus/scripts/lib/vectorbucket_benchmark_dataset.py`
-- Test: `milvus/scripts/lib/vectorbucket_benchmark_runner.py`
+- Test: `scripts/test-vectorbucket-benchmark.py`
+- Test: `scripts/lib/vectorbucket_benchmark_dataset.py`
+- Test: `scripts/lib/vectorbucket_benchmark_runner.py`
 
 - [ ] **Step 1: Verify dataset loader and report helpers**
 
-Run: `.runtime/venv-boto3/bin/python -m py_compile milvus/scripts/test-vectorbucket-benchmark.py milvus/scripts/lib/vectorbucket_benchmark_dataset.py milvus/scripts/lib/vectorbucket_benchmark_runner.py milvus/scripts/lib/vectorbucket_benchmark_report.py`
+Run: `.runtime/venv-boto3/bin/python -m py_compile scripts/test-vectorbucket-benchmark.py scripts/lib/vectorbucket_benchmark_dataset.py scripts/lib/vectorbucket_benchmark_runner.py scripts/lib/vectorbucket_benchmark_report.py`
 Expected: exits 0 with no output
 
 - [ ] **Step 2: Run a 10K benchmark against the local stack**
 
-Run: `.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 10k --batch-size 200 --query-count 100 --query-workers 8`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 10k --batch-size 200 --query-count 100 --query-workers 8`
 Expected: prints a report path under `.runtime/benchmarks/` and exits 0
 
 - [ ] **Step 3: Verify the 10K report fields**
@@ -607,16 +607,16 @@ Expected: prints `"10k"`, a positive dimension, `10000`, a positive query count,
 ### Task 9: Verify 100K And 1M Profiles
 
 **Files:**
-- Test: `milvus/scripts/test-vectorbucket-benchmark.py`
+- Test: `scripts/test-vectorbucket-benchmark.py`
 
 - [ ] **Step 1: Run the 100K benchmark**
 
-Run: `.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 100k --batch-size 500 --query-count 500 --query-workers 16`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 100k --batch-size 500 --query-count 500 --query-workers 16`
 Expected: exits 0 and writes `.runtime/benchmarks/vectorbucket-100k-*.json`
 
 - [ ] **Step 2: Run the 1M benchmark**
 
-Run: `.runtime/venv-boto3/bin/python milvus/scripts/test-vectorbucket-benchmark.py --profile 1m --batch-size 1000 --query-count 1000 --query-workers 16`
+Run: `.runtime/venv-boto3/bin/python scripts/test-vectorbucket-benchmark.py --profile 1m --batch-size 1000 --query-count 1000 --query-workers 16`
 Expected: exits 0 and writes `.runtime/benchmarks/vectorbucket-1m-*.json`
 
 - [ ] **Step 3: Compare the generated reports**

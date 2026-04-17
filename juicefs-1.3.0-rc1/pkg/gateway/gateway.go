@@ -194,6 +194,25 @@ func (n *jfsObjects) DeleteIndex(ctx context.Context, req *minio.DeleteIndexRequ
 	}))
 }
 
+func (n *jfsObjects) ChangeIndexModel(ctx context.Context, req *minio.ChangeIndexModelRequest) (*minio.ChangeIndexModelResponse, error) {
+	if n.vectorbucket == nil {
+		return nil, minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
+	}
+	resp, err := n.vectorbucket.ChangeIndexModel(ctx, &vectorbucket.ChangeIndexModelRequest{
+		RequestContext: toVectorRequestContext(req.RequestContext),
+		Target:         toVectorTarget(req.Target),
+		IndexModel:     req.IndexModel,
+	})
+	if err != nil {
+		return nil, translateVectorError(err)
+	}
+	return &minio.ChangeIndexModelResponse{
+		IndexARN:   resp.IndexARN,
+		IndexModel: resp.IndexModel,
+		State:      resp.State,
+	}, nil
+}
+
 func (n *jfsObjects) PutVectors(ctx context.Context, req *minio.PutVectorsRequest) error {
 	if n.vectorbucket == nil {
 		return minio.VectorAPIError{Code: "NotImplementedException", Message: "vector bucket api is not configured", Status: http.StatusNotImplemented}
