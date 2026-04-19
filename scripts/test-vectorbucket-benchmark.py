@@ -41,8 +41,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.lib.vectorbucket_benchmark_dataset import (
     iter_records,
+    load_profile,
     sample_stream_queries,
-    stream_profile,
 )
 from scripts.lib.vectorbucket_benchmark_report import dataclass_payload, summarize_latencies, write_report
 from scripts.lib.vectorbucket_bucket_policy import (
@@ -103,7 +103,8 @@ def run_step(step_name: str, func):
 
 def main() -> int:
     args = parse_args()
-    query_rows = sample_stream_queries(stream_profile(args.profile), max(args.query_count, 10))
+    dataset = load_profile(args.profile, REPO_ROOT)
+    query_rows = sample_stream_queries(dataset, max(args.query_count, 10))
     if not query_rows:
         raise RuntimeError(f"no rows available for profile {args.profile}")
     first_record = query_rows[0]
@@ -166,7 +167,7 @@ def main() -> int:
                 cfg,
                 (
                     {"key": record.key, "vector": record.vector, "metadata": record.metadata}
-                    for record in iter_records(stream_profile(args.profile))
+                    for record in iter_records(dataset)
                 ),
             ),
         )

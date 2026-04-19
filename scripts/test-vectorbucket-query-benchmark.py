@@ -39,7 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.lib.vectorbucket_benchmark_dataset import sample_stream_queries, stream_profile
+from scripts.lib.vectorbucket_benchmark_dataset import load_profile, sample_stream_queries
 from scripts.lib.vectorbucket_bucket_policy import (
     apply_bucket_index_model,
     bucket_index_model,
@@ -106,8 +106,9 @@ def latest_vector_bucket_name(repo_root: Path) -> str:
 
 def main() -> int:
     args = parse_args()
+    dataset = load_profile(args.profile, REPO_ROOT)
     query_rows = sample_stream_queries(
-        stream_profile(args.profile),
+        dataset,
         max(args.query_count, args.warmup_count, 10),
     )
     if not query_rows:
